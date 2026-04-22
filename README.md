@@ -10,6 +10,7 @@ The workspace supports:
 - four delivery states: `New`, `Backlog`, `Implementing`, and `Done`
 - Cognito sign-in against the shared user pool
 - DynamoDB-backed CRUD APIs for projects and work items
+- managed service API keys for trusted Codex-to-Codex integrations
 - an AWS-hosted UI suitable for `agile.xleo.com`
 
 ## Repository Layout
@@ -58,3 +59,11 @@ The deploy script will:
 - deploy the AWS stack
 - publish the Lambda runtime package
 - update Route 53 alias records for the custom domain
+
+## Service API Keys
+
+Super admins can generate and revoke service API keys in the hosted UI. Those keys are intended for trusted machine-to-machine access, such as another Codex project you control.
+
+- Admin management endpoints stay under the Cognito-protected `/api/service-keys` routes.
+- Service integrations call the unauthenticated `/service/agile/...` routes and must send `X-API-Key: <key>`.
+- Service keys currently have full workspace read/write/delete access until revoked.

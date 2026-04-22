@@ -1,3 +1,6 @@
+const DEFAULT_VIEW = "list";
+const WORK_ITEM_STATUSES = ["new", "backlog", "implementing", "done"];
+
 const config = normalizeConfig(window.AGILE_WORKSPACE_CONFIG || {});
 const auth = createAuthClient(config);
 
@@ -9,6 +12,15 @@ const state = {
   projectDetails: {},
   projectDraft: null,
   itemDraft: null,
+  serviceKeys: [],
+  serviceKeyDraft: buildBlankServiceKeyDraft(),
+  createdServiceKey: null,
+  activeView: DEFAULT_VIEW,
+  workspaceNotice: { message: "", tone: "" },
+  serviceKeyNotice: { message: "", tone: "" },
+  viewport: getViewportCategory(),
+  navDrawerOpen: false,
+  detailPaneOpen: false,
 };
 
 const elements = {
@@ -25,23 +37,20 @@ const elements = {
   sessionName: document.querySelector("#session-name"),
   sessionEmail: document.querySelector("#session-email"),
   pageTitle: document.querySelector("#page-title"),
-  kpiStrip: document.querySelector("#kpi-strip"),
+  pageSubtitle: document.querySelector("#page-subtitle"),
+  navToggleButton: document.querySelector("#nav-toggle-button"),
+  navCloseButton: document.querySelector("#nav-close-button"),
   projectCreateButton: document.querySelector("#project-create-button"),
   projectList: document.querySelector("#project-list"),
-  projectTitle: document.querySelector("#project-title"),
-  projectFeedback: document.querySelector("#project-feedback"),
-  projectSummary: document.querySelector("#project-summary"),
-  projectBoard: document.querySelector("#project-board"),
-  projectEditor: document.querySelector("#project-editor"),
-  projectSaveButton: document.querySelector("#project-save-button"),
-  projectDeleteButton: document.querySelector("#project-delete-button"),
+  viewSwitcher: document.querySelector("#view-switcher"),
+  projectSummaryStrip: document.querySelector("#project-summary-strip"),
+  workspaceView: document.querySelector("#workspace-view"),
+  detailPane: document.querySelector("#detail-pane"),
+  shellBackdrop: document.querySelector("#shell-backdrop"),
+  itemCreateActions: document.querySelector("#item-create-actions"),
   itemCreateEpic: document.querySelector("#item-create-epic"),
   itemCreateStory: document.querySelector("#item-create-story"),
   itemCreateTask: document.querySelector("#item-create-task"),
-  itemEditorTitle: document.querySelector("#item-editor-title"),
-  itemEditor: document.querySelector("#item-editor"),
-  itemSaveButton: document.querySelector("#item-save-button"),
-  itemDeleteButton: document.querySelector("#item-delete-button"),
 };
 
 elements.signInButton.addEventListener("click", async () => {
@@ -71,14 +80,6 @@ elements.projectCreateButton.addEventListener("click", () => {
   beginCreateProject();
 });
 
-elements.projectSaveButton.addEventListener("click", async () => {
-  await saveProjectDraft();
-});
-
-elements.projectDeleteButton.addEventListener("click", async () => {
-  await deleteSelectedProject();
-});
-
 elements.itemCreateEpic.addEventListener("click", () => {
   beginCreateItem("epic");
 });
@@ -91,20 +92,27 @@ elements.itemCreateTask.addEventListener("click", () => {
   beginCreateItem("task");
 });
 
-elements.itemSaveButton.addEventListener("click", async () => {
-  await saveItemDraft();
+elements.navToggleButton.addEventListener("click", () => {
+  toggleNavigationDrawer();
 });
 
-elements.itemDeleteButton.addEventListener("click", async () => {
-  await deleteSelectedItem();
+elements.navCloseButton.addEventListener("click", () => {
+  closeNavigationDrawer();
 });
 
-elements.projectEditor.addEventListener("input", handleProjectEditorInput);
-elements.projectEditor.addEventListener("change", handleProjectEditorInput);
-elements.itemEditor.addEventListener("input", handleItemEditorInput);
-elements.itemEditor.addEventListener("change", handleItemEditorInput);
+elements.shellBackdrop.addEventListener("click", () => {
+  closeOverlays();
+});
+
 elements.projectList.addEventListener("click", handleProjectListClick);
-elements.projectBoard.addEventListener("click", handleBoardClick);
+elements.viewSwitcher.addEventListener("click", handleViewSwitchClick);
+elements.workspaceView.addEventListener("click", handleWorkspaceViewClick);
+elements.workspaceView.addEventListener("input", handleWorkspaceViewInput);
+elements.workspaceView.addEventListener("change", handleWorkspaceViewInput);
+elements.detailPane.addEventListener("click", handleDetailPaneClick);
+elements.detailPane.addEventListener("input", handleDetailPaneInput);
+elements.detailPane.addEventListener("change", handleDetailPaneInput);
+window.addEventListener("resize", handleViewportResize);
 
 void initialize();
 
@@ -127,10 +135,12 @@ async function initialize() {
       12000,
       "Workspace session check timed out. Please refresh and sign in again.",
     );
+
     state.session = sessionPayload.session;
+    state.serviceKeyDraft = buildBlankServiceKeyDraft();
 
     showPortal();
-    renderShell();
+    renderAll();
     await refreshWorkspace({ preserveSelection: true });
   } catch (error) {
     console.error(error);
@@ -145,6 +155,13 @@ async function refreshWorkspace(options = {}) {
 
   try {
     await loadProjects({ preserveSelection });
+    if (state.session?.permissions?.agileManage) {
+      await loadServiceKeys();
+    } else {
+      state.serviceKeys = [];
+      state.serviceKeyDraft = buildBlankServiceKeyDraft();
+      state.createdServiceKey = null;
+    }
     if (state.selectedProjectId) {
       await loadProjectDetail(state.selectedProjectId, { force: forceProjectDetail });
     }
@@ -182,6 +199,7 @@ async function loadProjectDetail(projectId, options = {}) {
   if (!projectId) {
     return;
   }
+
   const { force = false } = options;
   if (!force && state.projectDetails[projectId]) {
     ensureDrafts(projectId, { force: false });
@@ -193,399 +211,696 @@ async function loadProjectDetail(projectId, options = {}) {
   ensureDrafts(projectId, { force: true });
 }
 
+async function loadServiceKeys() {
+  const payload = await apiRequest("/api/service-keys");
+  state.serviceKeys = Array.isArray(payload.serviceKeys) ? payload.serviceKeys : [];
+}
+
+function renderAll() {
+  if (!state.session) {
+    document.body.dataset.overlayOpen = "false";
+    return;
+  }
+
+  elements.portalShell.dataset.view = state.activeView;
+  elements.portalShell.dataset.viewport = state.viewport;
+  elements.portalShell.dataset.navOpen = String(state.navDrawerOpen);
+  elements.portalShell.dataset.detailOpen = String(shouldShowDetailOverlay());
+  elements.portalShell.dataset.overlayOpen = String(isOverlayOpen());
+  document.body.dataset.overlayOpen = String(isOverlayOpen());
+
+  renderShell();
+  renderProjectRail();
+  renderViewSwitcher();
+  renderSummaryStrip();
+  renderWorkspaceView();
+  renderDetailPane();
+}
+
 function renderShell() {
   document.title = state.session.app.title;
   elements.brandTitle.textContent = state.session.app.title;
   elements.brandSubtitle.textContent = state.session.app.subtitle;
-  elements.pageTitle.textContent = state.session.app.title;
   elements.sessionRole.textContent = state.session.user.roleLabel;
   elements.sessionName.textContent = state.session.user.displayName;
   elements.sessionEmail.textContent = state.session.user.email;
+
+  const projectSummary = selectedProjectSummary();
+  const projectDraft = activeProjectDraft();
+  elements.pageTitle.textContent = projectDraft?.name || projectSummary?.name || state.session.app.title;
+  elements.pageSubtitle.textContent = buildPageSubtitle(projectSummary, projectDraft);
+
+  const canManage = Boolean(state.session.permissions?.agileManage);
+  const canCreateItems = canManage && Boolean(state.selectedProjectId) && state.activeView !== "settings";
+
+  elements.projectCreateButton.disabled = !canManage;
+  elements.itemCreateEpic.disabled = !canCreateItems;
+  elements.itemCreateStory.disabled = !canCreateItems;
+  elements.itemCreateTask.disabled = !canCreateItems;
+  elements.itemCreateActions.hidden = state.activeView === "settings";
+  elements.itemCreateActions.setAttribute("aria-hidden", state.activeView === "settings" ? "true" : "false");
+  elements.navToggleButton.hidden = state.viewport === "desktop";
+  elements.navCloseButton.hidden = state.viewport === "desktop";
+  elements.navToggleButton.setAttribute("aria-expanded", String(state.navDrawerOpen));
+  elements.shellBackdrop.hidden = !isOverlayOpen();
 }
 
-function renderAll() {
-  renderKpis();
-  renderWorkspace();
+function renderProjectRail() {
+  elements.projectList.innerHTML = renderProjectList();
 }
 
-function renderKpis() {
-  const totalProjects = state.projects.length;
-  const counts = state.projects.reduce(
+function renderViewSwitcher() {
+  const buttons = elements.viewSwitcher.querySelectorAll("[data-view-switch]");
+  for (const button of buttons) {
+    const isActive = button.dataset.viewSwitch === state.activeView;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-pressed", String(isActive));
+  }
+}
+
+function renderSummaryStrip() {
+  const summary = selectedProjectSummary();
+  if (summary) {
+    elements.projectSummaryStrip.innerHTML = renderProjectStats(summary);
+    return;
+  }
+
+  elements.projectSummaryStrip.innerHTML = renderWorkspaceStats();
+}
+
+function renderWorkspaceView() {
+  if (state.activeView === "settings") {
+    elements.workspaceView.innerHTML = renderSettingsView();
+    return;
+  }
+
+  if (!activeProjectDraft()) {
+    elements.workspaceView.innerHTML = renderEmptySurface(
+      "Select a project from the rail or create a new one to begin planning work.",
+    );
+    return;
+  }
+
+  if (state.activeView === "board") {
+    elements.workspaceView.innerHTML = renderBoardView();
+    return;
+  }
+
+  elements.workspaceView.innerHTML = renderListView();
+}
+
+function renderDetailPane() {
+  if (state.activeView === "settings") {
+    setVisibility(elements.detailPane, false, "block");
+    elements.detailPane.innerHTML = "";
+    return;
+  }
+
+  const shouldRenderPane = state.viewport === "desktop" || shouldShowDetailOverlay();
+  setVisibility(elements.detailPane, shouldRenderPane, "block");
+  if (!shouldRenderPane) {
+    elements.detailPane.innerHTML = "";
+    return;
+  }
+
+  if (!activeProjectDraft()) {
+    elements.detailPane.innerHTML = `
+      <div class="detail-pane-shell">
+        <div class="empty-state">Choose a project to open the detail pane.</div>
+      </div>
+    `;
+    return;
+  }
+
+  const itemDraft = activeItemDraft();
+  if (!itemDraft) {
+    elements.detailPane.innerHTML = `
+      <div class="detail-pane-shell">
+        <div class="empty-state">Select a work item from the list or board to edit it here.</div>
+      </div>
+    `;
+    return;
+  }
+
+  elements.detailPane.innerHTML = renderItemDetailPane();
+}
+
+function renderProjectList() {
+  if (!state.projects.length) {
+    return `
+      <div class="empty-state">
+        No agile projects are stored yet. Create one to start organizing work.
+      </div>
+    `;
+  }
+
+  const projectItems = state.projects
+    .map((project) => {
+      const isActive = project.projectId === state.selectedProjectId && !isCreatingProject();
+      const implementing = project.countsByStatus?.implementing || 0;
+      const countsText = `${project.itemCount || 0} items`;
+      const progressText = implementing ? `${implementing} in progress` : `${project.countsByStatus?.backlog || 0} in backlog`;
+      return `
+        <button
+          class="project-nav-item ${isActive ? "is-active" : ""}"
+          type="button"
+          data-project-select="${escapeHtml(project.projectId)}"
+        >
+          <div class="project-nav-item__row">
+            <span class="project-nav-item__name">${escapeHtml(project.name)}</span>
+            ${renderBadge(formatProjectStatus(project.status), project.status === "active" ? "accent" : "neutral")}
+          </div>
+          <div class="project-nav-item__meta">${escapeHtml(countsText)}</div>
+          <div class="project-nav-item__subtle">${escapeHtml(progressText)}</div>
+        </button>
+      `;
+    })
+    .join("");
+
+  if (isCreatingProject()) {
+    return `${projectItems}<div class="empty-state">A new project draft is open in Settings.</div>`;
+  }
+
+  return projectItems;
+}
+
+function renderListView() {
+  const detail = selectedProjectDetail();
+  const items = Array.isArray(detail?.items) ? detail.items : [];
+  const itemMaps = buildWorkItemMaps(items);
+
+  return `
+    <section class="surface">
+      ${renderNotice(state.workspaceNotice)}
+      <div class="surface-header">
+        <div>
+          <p class="section-label">List view</p>
+          <h3 class="surface-title">Work items</h3>
+        </div>
+        <div class="inline-meta">${escapeHtml(`${items.length} items`)}</div>
+      </div>
+      <div class="surface-body">
+        ${items.length ? renderWorkTable(items, itemMaps) : `
+          <div class="empty-state">This project has no work items yet. Start with an epic or a story.</div>
+        `}
+      </div>
+    </section>
+  `;
+}
+
+function renderBoardView() {
+  const detail = selectedProjectDetail();
+  const items = Array.isArray(detail?.items) ? detail.items : [];
+  const itemMaps = buildWorkItemMaps(items);
+
+  return `
+    <section class="surface">
+      ${renderNotice(state.workspaceNotice)}
+      <div class="surface-header">
+        <div>
+          <p class="section-label">Board view</p>
+          <h3 class="surface-title">Delivery flow</h3>
+        </div>
+        <div class="inline-meta">${escapeHtml(`${items.length} items`)}</div>
+      </div>
+      <div class="surface-body">
+        ${items.length ? `
+          <div class="board-grid">
+            ${WORK_ITEM_STATUSES.map((status) => renderBoardColumn(status, items.filter((item) => item.status === status), itemMaps)).join("")}
+          </div>
+        ` : `
+          <div class="empty-state">This project has no work items yet. Start with an epic or a story.</div>
+        `}
+      </div>
+    </section>
+  `;
+}
+
+function renderSettingsView() {
+  const canManage = Boolean(state.session?.permissions?.agileManage);
+  return `
+    ${renderNotice(state.workspaceNotice)}
+    <div class="settings-layout">
+      ${renderProjectSettingsSection(canManage)}
+      ${canManage ? renderServiceAccessSection() : ""}
+    </div>
+  `;
+}
+
+function renderProjectSettingsSection(canManage) {
+  const projectDraft = activeProjectDraft();
+  if (!projectDraft) {
+    return `
+      <section class="settings-section">
+        <div class="settings-section-header">
+          <div>
+            <p class="section-label">Project settings</p>
+            <h3 class="surface-title">Configuration</h3>
+          </div>
+        </div>
+        <div class="settings-section-body">
+          <div class="empty-state">Select an existing project or create a new one to edit project settings.</div>
+        </div>
+      </section>
+    `;
+  }
+
+  const isExisting = Boolean(state.selectedProjectId && projectDraft.project_id);
+
+  return `
+    <section class="settings-section">
+      <div class="settings-section-header">
+        <div>
+          <p class="section-label">Project settings</p>
+          <h3 class="surface-title">${escapeHtml(projectDraft.name || "Project configuration")}</h3>
+        </div>
+        <div class="settings-actions">
+          <button class="button button-primary" type="button" data-action="save-project" ${!canManage ? "disabled" : ""}>Save project</button>
+          <button class="button" type="button" data-action="delete-project" ${!canManage || !state.selectedProjectId ? "disabled" : ""}>Delete project</button>
+        </div>
+      </div>
+      <div class="settings-section-body">
+        <div class="settings-form">
+          ${renderField("Project key", "project_id", projectDraft.project_id || "", {
+            editor: "project",
+            placeholder: "team-ops-platform",
+            disabled: isExisting,
+          })}
+          ${renderField("Project name", "name", projectDraft.name || "", {
+            editor: "project",
+            className: "field--title",
+            placeholder: "Operations planning workspace",
+            required: true,
+          })}
+          ${renderField("Status", "status", projectDraft.status || "active", {
+            editor: "project",
+            type: "select",
+            options: projectStatusOptions(),
+          })}
+          ${renderField("Description", "description", projectDraft.description || "", {
+            editor: "project",
+            type: "textarea",
+            className: "field--large",
+            rows: 7,
+            placeholder: "Capture the purpose, scope, stakeholders, and delivery guardrails for this project.",
+          })}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderServiceAccessSection() {
+  return `
+    <section class="settings-section">
+      <div class="settings-section-header">
+        <div>
+          <p class="section-label">Service access</p>
+          <h3 class="surface-title">Codex API keys</h3>
+        </div>
+        <button class="button button-primary" type="button" data-action="create-service-key">Generate key</button>
+      </div>
+      <div class="settings-section-body">
+        ${renderNotice(state.serviceKeyNotice)}
+        <div class="service-key-callout">
+          <div class="stack">
+            <p class="meta-label">Trusted automation</p>
+            <p class="meta-text">Use <span class="mono">X-API-Key</span> from another Codex project against <span class="mono">${escapeHtml(serviceBaseUrl())}/agile/projects</span>.</p>
+          </div>
+        </div>
+        <div class="service-key-form">
+          ${renderField("Key label", "label", state.serviceKeyDraft.label || "", {
+            editor: "service-key",
+            placeholder: "Personal Codex automation",
+          })}
+          ${state.createdServiceKey ? `
+            <div class="service-key-callout">
+              <div class="stack">
+                <p class="meta-label">Copy now</p>
+                <p class="meta-text">The full key is only shown once.</p>
+                <div class="mono">${escapeHtml(state.createdServiceKey)}</div>
+              </div>
+            </div>
+          ` : ""}
+        </div>
+        <div class="service-key-list">
+          ${state.serviceKeys.length ? state.serviceKeys.map((serviceKey) => renderServiceKeyRow(serviceKey)).join("") : `
+            <div class="empty-state">No service keys exist yet. Generate one when you want another Codex project to read and write records.</div>
+          `}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderItemDetailPane() {
+  const detail = selectedProjectDetail();
+  const items = Array.isArray(detail?.items) ? detail.items : [];
+  const itemDraft = activeItemDraft();
+  const canManage = Boolean(state.session?.permissions?.agileManage);
+  const isExisting = Boolean(state.selectedItemId && itemDraft.item_id);
+  const parentOptions = itemParentOptions(items, itemDraft);
+  const itemMaps = buildWorkItemMaps(items);
+  const parentLabel = itemDraft.parent_id ? itemMaps.itemsById.get(itemDraft.parent_id)?.title || itemDraft.parent_id : "No parent";
+  const childCount = itemMaps.childCountByParent[itemDraft.item_id] || 0;
+
+  return `
+    <div class="detail-pane-shell">
+      <div class="detail-pane-header">
+        <div class="stack">
+          <p class="section-label">Selected work item</p>
+          <h3 class="detail-pane-title">${escapeHtml(itemDraft.title || itemDraft.item_id || `New ${formatItemType(itemDraft.item_type).toLowerCase()}`)}</h3>
+          <p class="detail-pane-summary">
+            ${escapeHtml(formatItemType(itemDraft.item_type))} &middot;
+            ${escapeHtml(formatItemStatus(itemDraft.status))} &middot;
+            ${escapeHtml(formatPriority(itemDraft.priority))}
+          </p>
+          <p class="detail-pane-summary">
+            ${escapeHtml(parentLabel)}${childCount ? ` &middot; ${childCount} child${childCount === 1 ? "" : "ren"}` : ""}
+          </p>
+        </div>
+        <div class="detail-pane-actions">
+          <button class="button button-subtle detail-pane-close" type="button" data-action="close-item-editor">Close</button>
+          <button class="button button-primary" type="button" data-action="save-item" ${!canManage ? "disabled" : ""}>Save item</button>
+          <button class="button" type="button" data-action="delete-item" ${!canManage || !state.selectedItemId ? "disabled" : ""}>Delete item</button>
+        </div>
+      </div>
+      <div class="detail-pane-body">
+        <div class="detail-form">
+          ${renderField("Item key", "item_id", itemDraft.item_id || "", {
+            editor: "item",
+            placeholder: "story-key",
+            disabled: isExisting,
+          })}
+          ${renderField("Title", "title", itemDraft.title || "", {
+            editor: "item",
+            className: "field--title",
+            placeholder: "As a user, I can ...",
+            required: true,
+          })}
+          ${renderField("Type", "item_type", itemDraft.item_type || "story", {
+            editor: "item",
+            type: "select",
+            options: itemTypeOptions(),
+          })}
+          ${renderField("State", "status", itemDraft.status || "new", {
+            editor: "item",
+            type: "select",
+            options: itemStatusOptions(),
+          })}
+          ${renderField("Priority", "priority", itemDraft.priority || "medium", {
+            editor: "item",
+            type: "select",
+            options: priorityOptions(),
+          })}
+          ${renderField("Parent", "parent_id", itemDraft.parent_id || "", {
+            editor: "item",
+            type: "select",
+            options: parentOptions,
+          })}
+          ${renderField("Rank", "rank", valueOrEmpty(itemDraft.rank ?? 100), {
+            editor: "item",
+            type: "number",
+          })}
+          ${renderField("Assignees", "assignee_emails", joinList(itemDraft.assignee_emails || []), {
+            editor: "item",
+            valueType: "csv",
+            placeholder: "user@example.com",
+          })}
+          ${renderField("Tags", "tags", joinList(itemDraft.tags || []), {
+            editor: "item",
+            valueType: "csv",
+            placeholder: "ui, backend, aws",
+          })}
+          ${renderField("Summary", "summary", itemDraft.summary || "", {
+            editor: "item",
+            type: "textarea",
+            className: "field--large",
+            rows: 6,
+            placeholder: "Short planning note or implementation summary.",
+          })}
+          ${renderField("User story", "user_story", itemDraft.user_story || "", {
+            editor: "item",
+            type: "textarea",
+            className: "field--large",
+            rows: 6,
+            placeholder: "As a ..., I want ..., so that ...",
+          })}
+          ${renderField("Acceptance criteria", "acceptance_criteria", (itemDraft.acceptance_criteria || []).join("\n"), {
+            editor: "item",
+            type: "textarea",
+            valueType: "lines",
+            className: "field--xlarge",
+            rows: 8,
+            placeholder: "One acceptance criterion per line",
+          })}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderWorkTable(items, itemMaps) {
+  return `
+    <div class="work-table">
+      <div class="work-row work-row--head">
+        <div class="table-head work-cell--title">Title</div>
+        <div class="table-head work-cell--type">Type</div>
+        <div class="table-head work-cell--status">Status</div>
+        <div class="table-head work-cell--priority">Priority</div>
+        <div class="table-head work-cell--parent">Parent</div>
+        <div class="table-head work-cell--assignee">Assignee</div>
+        <div class="table-head work-cell--tags">Tags</div>
+      </div>
+      ${items.map((item) => renderWorkRow(item, itemMaps)).join("")}
+    </div>
+  `;
+}
+
+function renderWorkRow(item, itemMaps) {
+  const summary = item.userStory || item.summary || "";
+  const parent = item.parentId ? itemMaps.itemsById.get(item.parentId)?.title || item.parentId : "-";
+  const assignee = item.assigneeEmails?.[0] || "-";
+  const tags = item.tags?.length ? item.tags.join(", ") : "-";
+
+  return `
+    <button
+      class="work-row ${item.itemId === state.selectedItemId ? "is-selected" : ""}"
+      type="button"
+      data-item-select="${escapeHtml(item.itemId)}"
+    >
+      <div class="work-cell work-cell--title" data-cell-label="Title">
+        <div class="work-title">
+          <strong>${escapeHtml(item.title)}</strong>
+          <span>${escapeHtml(summary ? truncate(summary, 88) : item.itemId)}</span>
+        </div>
+      </div>
+      <div class="work-cell work-cell--type" data-cell-label="Type">${escapeHtml(formatItemType(item.itemType))}</div>
+      <div class="work-cell work-cell--status" data-cell-label="Status">${renderBadge(formatItemStatus(item.status), item.status === "implementing" ? "accent" : "neutral")}</div>
+      <div class="work-cell work-cell--priority" data-cell-label="Priority">${escapeHtml(formatPriority(item.priority))}</div>
+      <div class="work-cell work-cell--parent" data-cell-label="Parent">${escapeHtml(parent)}</div>
+      <div class="work-cell work-cell--assignee" data-cell-label="Assignee">${escapeHtml(assignee)}</div>
+      <div class="work-cell work-cell--tags" data-cell-label="Tags">${escapeHtml(tags)}</div>
+    </button>
+  `;
+}
+
+function renderBoardColumn(status, items, itemMaps) {
+  return `
+    <section class="board-column">
+      <div class="board-column-header">
+        <div>
+          <p class="section-label">${escapeHtml(formatItemStatus(status))}</p>
+          <h3>${escapeHtml(String(items.length))}</h3>
+        </div>
+        ${renderBadge(formatItemStatus(status), status === "implementing" ? "accent" : "neutral")}
+      </div>
+      <div class="board-column-body">
+        ${items.length ? items.map((item) => renderBoardCard(item, itemMaps)).join("") : `<div class="empty-state">No items in ${escapeHtml(formatItemStatus(status))}.</div>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderBoardCard(item, itemMaps) {
+  const parent = item.parentId ? itemMaps.itemsById.get(item.parentId)?.title || item.parentId : "";
+  const childCount = itemMaps.childCountByParent[item.itemId] || 0;
+  const secondaryBits = [
+    formatItemType(item.itemType),
+    formatPriority(item.priority),
+    item.assigneeEmails?.[0] || "",
+  ].filter(Boolean);
+  const referenceBits = [
+    parent ? `Parent: ${parent}` : "",
+    childCount ? `${childCount} child${childCount === 1 ? "" : "ren"}` : "",
+  ].filter(Boolean);
+
+  return `
+    <button
+      class="board-card ${item.itemId === state.selectedItemId ? "is-selected" : ""}"
+      type="button"
+      data-item-select="${escapeHtml(item.itemId)}"
+    >
+      <strong class="board-card-title">${escapeHtml(item.title)}</strong>
+      ${secondaryBits.length ? `<div class="board-card-meta">${escapeHtml(secondaryBits.join(" | "))}</div>` : ""}
+      ${referenceBits.length ? `<div class="board-card-meta">${escapeHtml(referenceBits.join(" | "))}</div>` : ""}
+    </button>
+  `;
+}
+
+function renderServiceKeyRow(serviceKey) {
+  return `
+    <div class="service-key-row">
+      <div class="service-key-row__body">
+        <strong>${escapeHtml(serviceKey.label || serviceKey.keyId)}</strong>
+        <div class="service-key-row__meta">${escapeHtml(serviceKey.keyPreview || serviceKey.keyId)}</div>
+        <div class="service-key-row__meta">
+          ${escapeHtml(`Created ${formatTimestamp(serviceKey.createdAtUtc)}`)}
+          ${serviceKey.lastUsedAtUtc ? ` | ${escapeHtml(`Last used ${formatTimestamp(serviceKey.lastUsedAtUtc)}`)}` : ""}
+        </div>
+      </div>
+      <div class="service-key-row__meta">
+        ${renderBadge(formatServiceKeyStatus(serviceKey.status), serviceKey.status === "active" ? "accent" : "neutral")}
+        <button
+          class="button"
+          type="button"
+          data-action="revoke-service-key"
+          data-service-key-id="${escapeHtml(serviceKey.keyId)}"
+          ${serviceKey.status !== "active" ? "disabled" : ""}
+        >
+          Revoke
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+function renderProjectStats(project) {
+  const countsByStatus = project?.countsByStatus || {};
+  const stats = [
+    { label: "Status", value: formatProjectStatus(project?.status || "active") },
+    { label: "Items", value: String(project?.itemCount || 0) },
+    { label: "New", value: String(countsByStatus.new || 0) },
+    { label: "Backlog", value: String(countsByStatus.backlog || 0) },
+    { label: "Implementing", value: String(countsByStatus.implementing || 0) },
+    { label: "Done", value: String(countsByStatus.done || 0) },
+  ];
+
+  return stats.map((item) => `
+    <div class="summary-stat">
+      <span>${escapeHtml(item.label)}</span>
+      <strong>${escapeHtml(item.value)}</strong>
+    </div>
+  `).join("");
+}
+
+function renderWorkspaceStats() {
+  const aggregate = state.projects.reduce(
     (accumulator, project) => {
+      accumulator.projects += 1;
       accumulator.new += project.countsByStatus?.new || 0;
       accumulator.backlog += project.countsByStatus?.backlog || 0;
       accumulator.implementing += project.countsByStatus?.implementing || 0;
       accumulator.done += project.countsByStatus?.done || 0;
       return accumulator;
     },
-    { new: 0, backlog: 0, implementing: 0, done: 0 },
+    { projects: 0, new: 0, backlog: 0, implementing: 0, done: 0 },
   );
 
-  const cards = [
-    {
-      label: "Projects",
-      value: String(totalProjects),
-      note: totalProjects ? "Active workspaces available in the repo." : "Create your first project to start planning.",
-    },
-    {
-      label: "Refinement",
-      value: String(counts.new),
-      note: "Items still being shaped and clarified.",
-    },
-    {
-      label: "Backlog",
-      value: String(counts.backlog),
-      note: "Ready-to-build stories and tasks.",
-    },
-    {
-      label: "Implementing",
-      value: String(counts.implementing),
-      note: "Active work currently in flight.",
-    },
-    {
-      label: "Done",
-      value: String(counts.done),
-      note: "Completed and accepted work.",
-    },
+  const stats = [
+    { label: "Projects", value: String(aggregate.projects) },
+    { label: "New", value: String(aggregate.new) },
+    { label: "Backlog", value: String(aggregate.backlog) },
+    { label: "Implementing", value: String(aggregate.implementing) },
+    { label: "Done", value: String(aggregate.done) },
   ];
 
-  elements.kpiStrip.innerHTML = cards
-    .map(
-      (card) => `
-        <article class="kpi-card">
-          <p class="table-meta">${escapeHtml(card.label)}</p>
-          <strong>${escapeHtml(card.value)}</strong>
-          <p class="small-note">${escapeHtml(card.note)}</p>
-        </article>
-      `,
-    )
-    .join("");
-}
-
-function renderWorkspace() {
-  const canManage = Boolean(state.session?.permissions?.agileManage);
-  const detail = selectedProjectDetail();
-  const projectDraft = activeProjectDraft();
-  const itemDraft = activeItemDraft();
-  const projectSummary = selectedProjectSummary();
-
-  elements.projectList.innerHTML = renderProjectList();
-  elements.projectTitle.textContent = projectDraft?.name || projectSummary?.name || "Select a project";
-
-  if (!projectDraft) {
-    elements.projectSummary.innerHTML = `<div class="empty-state">Create a project to organize epics, stories, tasks, and acceptance criteria.</div>`;
-    elements.projectBoard.innerHTML = `<div class="empty-state">Select or create a project to open the agile board.</div>`;
-    elements.projectEditor.innerHTML = `<div class="empty-state">Choose a project from the list or create a new one.</div>`;
-    elements.itemEditorTitle.textContent = "Select an item";
-    elements.itemEditor.innerHTML = `<div class="empty-state">Once a project is selected, add epics, stories, or tasks here.</div>`;
-  } else {
-    elements.projectSummary.innerHTML = renderProjectSummary(projectSummary || detail?.project || projectDraft);
-    elements.projectBoard.innerHTML = detail?.board
-      ? renderProjectBoard(detail.board)
-      : `<div class="empty-state">This project has no work items yet. Start with an epic or a story.</div>`;
-    elements.projectEditor.innerHTML = renderProjectEditorForm(projectDraft);
-    elements.itemEditorTitle.textContent = itemDraft?.title || itemDraft?.item_id || "Select an item";
-    elements.itemEditor.innerHTML = renderItemEditorForm({
-      itemDraft,
-      items: detail?.items || [],
-      projectDraft,
-    });
-  }
-
-  elements.projectCreateButton.disabled = !canManage;
-  elements.projectSaveButton.disabled = !canManage || !projectDraft;
-  elements.projectDeleteButton.disabled = !canManage || !(projectDraft && state.selectedProjectId);
-  elements.itemCreateEpic.disabled = !canManage || !projectDraft || !state.selectedProjectId;
-  elements.itemCreateStory.disabled = !canManage || !projectDraft || !state.selectedProjectId;
-  elements.itemCreateTask.disabled = !canManage || !projectDraft || !state.selectedProjectId;
-  elements.itemSaveButton.disabled = !canManage || !itemDraft;
-  elements.itemDeleteButton.disabled = !canManage || !(itemDraft && state.selectedItemId);
-
-  if (!elements.projectFeedback.textContent.trim()) {
-    setEditorFeedback(
-      elements.projectFeedback,
-      projectDraft
-        ? "Keep projects lean: epics for outcomes, stories for user value, and tasks for execution detail."
-        : "Create a project to start capturing stories and acceptance criteria.",
-      "",
-    );
-  }
-}
-
-function renderProjectList() {
-  if (!state.projects.length) {
-    return `<div class="empty-state">No agile projects are stored yet. Create one to begin organizing work.</div>`;
-  }
-
-  return (
-    state.projects
-      .map((project) => `
-        <button class="list-item ${project.projectId === state.selectedProjectId && !isCreatingProject() ? "is-active" : ""}" type="button" data-project-select="${escapeHtml(project.projectId)}">
-          <strong>${escapeHtml(project.name)}</strong>
-          <div class="list-item-meta">
-            ${renderPill(formatProjectStatus(project.status), { status: project.status })}
-            ${renderPill(`${project.itemCount || 0} item${project.itemCount === 1 ? "" : "s"}`, { kind: "neutral" })}
-          </div>
-          <div class="list-item-subtle">
-            <span>${escapeHtml(`${project.countsByType?.epic || 0} epics`)}</span>
-            <span>${escapeHtml(`${project.countsByType?.story || 0} stories`)}</span>
-            <span>${escapeHtml(`${project.countsByType?.task || 0} tasks`)}</span>
-            <span>${escapeHtml(`${project.countsByStatus?.implementing || 0} implementing`)}</span>
-          </div>
-        </button>
-      `)
-      .join("")
-      + (isCreatingProject() ? `<div class="empty-state">A new project draft is open in the editor. Save it to add it to the live list.</div>` : "")
-  );
-}
-
-function renderProjectSummary(project) {
-  const countsByStatus = project?.countsByStatus || {};
-  const countsByType = project?.countsByType || {};
-  const items = [
-    {
-      label: "Status",
-      value: formatProjectStatus(project?.status || "active"),
-      note: project?.description || "Use the description to capture purpose, scope, or stakeholder context.",
-    },
-    {
-      label: "Work items",
-      value: String(project?.itemCount || 0),
-      note: `${countsByType.epic || 0} epics, ${countsByType.story || 0} stories, ${countsByType.task || 0} tasks`,
-    },
-    {
-      label: "Refinement",
-      value: String(countsByStatus.new || 0),
-      note: "Items still being shaped or clarified.",
-    },
-    {
-      label: "Backlog",
-      value: String(countsByStatus.backlog || 0),
-      note: "Work ready to build.",
-    },
-    {
-      label: "Implementing",
-      value: String(countsByStatus.implementing || 0),
-      note: "Active work currently in flight.",
-    },
-    {
-      label: "Done",
-      value: String(countsByStatus.done || 0),
-      note: "Completed and accepted work.",
-    },
-  ];
-
-  return items
-    .map(
-      (item) => `
-        <article class="metric-panel">
-          <p class="table-meta">${escapeHtml(item.label)}</p>
-          <strong>${escapeHtml(item.value)}</strong>
-          <p class="small-note">${escapeHtml(item.note)}</p>
-        </article>
-      `,
-    )
-    .join("");
-}
-
-function renderProjectBoard(board) {
-  if (!board?.columns?.length) {
-    return `<div class="empty-state">No board data is available yet for this project.</div>`;
-  }
-
-  return board.columns
-    .map((column) => `
-      <section class="agile-column">
-        <div class="agile-column-header">
-          <div>
-            <p class="section-label">${escapeHtml(column.label)}</p>
-            <h4>${escapeHtml(String(column.count || 0))}</h4>
-          </div>
-          ${renderPill(String(column.count || 0), { status: column.status })}
-        </div>
-        <div class="agile-column-cards">
-          ${column.items?.length
-            ? column.items.map((item) => renderProjectCard(item)).join("")
-            : `<div class="empty-state">No items in ${escapeHtml(column.label)}.</div>`}
-        </div>
-      </section>
-    `)
-    .join("");
-}
-
-function renderProjectCard(item, depth = 0) {
-  const selected = item.itemId === state.selectedItemId;
-  const summary = item.userStory || item.summary || "";
-  const criteriaCount = Array.isArray(item.acceptanceCriteria) ? item.acceptanceCriteria.length : 0;
-  return `
-    <div class="agile-card-shell" style="${depth > 0 ? `margin-left:${depth * 16}px;` : ""}">
-      <button
-        class="agile-card ${selected ? "is-selected" : ""}"
-        type="button"
-        data-item-select="${escapeHtml(item.itemId)}"
-      >
-        <div class="agile-card-header">
-          <strong class="agile-card-title">${escapeHtml(item.title)}</strong>
-          ${renderPill(formatItemType(item.itemType), { type: item.itemType })}
-        </div>
-        <div class="agile-card-meta">
-          ${renderPill(formatItemStatus(item.status), { status: item.status })}
-          ${renderPill(formatPriority(item.priority), { priority: item.priority })}
-          ${renderPill(`${criteriaCount} criteria`, { kind: criteriaCount ? "success" : "warning" })}
-        </div>
-        ${summary ? `<p class="agile-card-story">${escapeHtml(summary)}</p>` : ""}
-      </button>
-      ${renderProjectCardChildren(item.children || [], depth + 1)}
+  return stats.map((item) => `
+    <div class="summary-stat">
+      <span>${escapeHtml(item.label)}</span>
+      <strong>${escapeHtml(item.value)}</strong>
     </div>
-  `;
+  `).join("");
 }
 
-function renderProjectCardChildren(children, depth) {
-  if (!children.length) {
+function renderNotice(notice) {
+  if (!notice?.message) {
     return "";
   }
+  return `<p class="notice ${notice.tone || ""}">${escapeHtml(notice.message)}</p>`;
+}
+
+function renderEmptySurface(message) {
   return `
-    <div class="agile-children">
-      ${children.map((child) => renderProjectCard(child, depth)).join("")}
-    </div>
+    <section class="surface">
+      ${renderNotice(state.workspaceNotice)}
+      <div class="empty-state">${escapeHtml(message)}</div>
+    </section>
   `;
 }
 
-function renderProjectEditorForm(project) {
-  const isExisting = Boolean(state.selectedProjectId && project?.project_id);
+function renderField(label, path, value, options = {}) {
+  const {
+    editor = "item",
+    type = "text",
+    valueType = type === "number" ? "int" : "string",
+    placeholder = "",
+    required = false,
+    step = "1",
+    disabled = false,
+    options: selectOptions = [],
+    className = "",
+    rows = 6,
+  } = options;
+
+  const controlAttributes = [
+    `data-editor="${escapeHtml(editor)}"`,
+    `data-field-path="${escapeHtml(path)}"`,
+    `data-value-type="${escapeHtml(valueType)}"`,
+    placeholder ? `placeholder="${escapeHtml(placeholder)}"` : "",
+    required ? "required" : "",
+    disabled ? "disabled" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  if (type === "textarea") {
+    return `
+      <label class="field ${className}">
+        <span>${escapeHtml(label)}</span>
+        <textarea rows="${escapeHtml(String(rows))}" ${controlAttributes}>${escapeHtml(value ?? "")}</textarea>
+      </label>
+    `;
+  }
+
+  if (type === "select") {
+    return `
+      <label class="field ${className}">
+        <span>${escapeHtml(label)}</span>
+        <select ${controlAttributes}>
+          ${selectOptions
+            .map((option) => `
+              <option value="${escapeHtml(option.value)}" ${String(option.value) === String(value ?? "") ? "selected" : ""}>
+                ${escapeHtml(option.label)}
+              </option>
+            `)
+            .join("")}
+        </select>
+      </label>
+    `;
+  }
+
   return `
-    <div class="editor-grid">
-      <section class="editor-section">
-        <div class="editor-toolbar">
-          <div>
-            <p class="section-label">Project identity</p>
-            <h4>Project basics</h4>
-          </div>
-        </div>
-        <div class="editor-row">
-          ${renderField("Project key", "project_id", project.project_id || "", {
-            placeholder: "team-ops-platform",
-            disabled: isExisting,
-          })}
-          ${renderField("Status", "status", project.status || "active", {
-            type: "select",
-            options: projectStatusOptions(),
-          })}
-        </div>
-        <div class="editor-row">
-          ${renderField("Project name", "name", project.name || "", {
-            placeholder: "Operations planning workspace",
-            required: true,
-          })}
-        </div>
-        ${renderField("Description", "description", project.description || "", {
-          type: "textarea",
-          placeholder: "Capture the purpose of this project, the intended outcome, and any important guardrails.",
-        })}
-      </section>
-    </div>
+    <label class="field ${className}">
+      <span>${escapeHtml(label)}</span>
+      <input
+        type="${escapeHtml(type)}"
+        value="${escapeHtml(value ?? "")}"
+        ${type === "number" ? `step="${escapeHtml(step)}"` : ""}
+        ${controlAttributes}
+      >
+    </label>
   `;
-}
-
-function renderItemEditorForm({ itemDraft, items, projectDraft }) {
-  if (!projectDraft || !state.selectedProjectId) {
-    return `<div class="empty-state">Select a project first so items have somewhere to live.</div>`;
-  }
-  if (!itemDraft) {
-    return `<div class="empty-state">Select an item on the board or create a new epic, story, or task.</div>`;
-  }
-
-  const isExisting = Boolean(state.selectedItemId && itemDraft.item_id);
-  const parentOptions = itemParentOptions(items, itemDraft);
-  return `
-    <div class="editor-grid">
-      <section class="editor-section">
-        <div class="editor-toolbar">
-          <div>
-            <p class="section-label">Work item</p>
-            <h4>Story details and acceptance criteria</h4>
-          </div>
-        </div>
-        <div class="editor-row editor-row--quad">
-          ${renderField("Item key", "item_id", itemDraft.item_id || "", {
-            placeholder: "story-key",
-            disabled: isExisting,
-          })}
-          ${renderField("Type", "item_type", itemDraft.item_type || "story", {
-            type: "select",
-            options: itemTypeOptions(),
-          })}
-          ${renderField("State", "status", itemDraft.status || "new", {
-            type: "select",
-            options: itemStatusOptions(),
-          })}
-          ${renderField("Priority", "priority", itemDraft.priority || "medium", {
-            type: "select",
-            options: priorityOptions(),
-          })}
-        </div>
-        <div class="editor-row">
-          ${renderField("Title", "title", itemDraft.title || "", {
-            placeholder: "As a user, I can ...",
-            required: true,
-          })}
-          ${renderField("Parent", "parent_id", itemDraft.parent_id || "", {
-            type: "select",
-            options: parentOptions,
-          })}
-        </div>
-        <div class="editor-row editor-row--triple">
-          ${renderField("Rank", "rank", valueOrEmpty(itemDraft.rank ?? 100), { type: "number" })}
-          ${renderField("Assignees", "assignee_emails", joinList(itemDraft.assignee_emails || []), {
-            valueType: "csv",
-            placeholder: "user@example.com",
-          })}
-          ${renderField("Tags", "tags", joinList(itemDraft.tags || []), {
-            valueType: "csv",
-            placeholder: "ui, backend, aws",
-          })}
-        </div>
-        ${renderField("Summary", "summary", itemDraft.summary || "", {
-          type: "textarea",
-          placeholder: "Short planning note or implementation summary.",
-        })}
-        ${renderField("User story", "user_story", itemDraft.user_story || "", {
-          type: "textarea",
-          placeholder: "As a ..., I want ..., so that ...",
-        })}
-        ${renderField("Acceptance criteria", "acceptance_criteria", (itemDraft.acceptance_criteria || []).join("\n"), {
-          type: "textarea",
-          valueType: "lines",
-          placeholder: "One acceptance criterion per line",
-        })}
-      </section>
-    </div>
-  `;
-}
-
-function handleProjectEditorInput(event) {
-  const control = event.target;
-  const path = control.dataset.fieldPath;
-  if (!path || !state.projectDraft) {
-    return;
-  }
-  setNestedValue(state.projectDraft, path, readControlValue(control));
-}
-
-function handleItemEditorInput(event) {
-  const control = event.target;
-  const path = control.dataset.fieldPath;
-  if (!path || !state.itemDraft) {
-    return;
-  }
-  setNestedValue(state.itemDraft, path, readControlValue(control));
-  if (path === "item_type") {
-    const options = itemParentOptions(selectedProjectDetail()?.items || [], state.itemDraft);
-    if (!options.some((option) => option.value === state.itemDraft.parent_id)) {
-      state.itemDraft.parent_id = "";
-    }
-    renderWorkspace();
-  }
 }
 
 async function handleProjectListClick(event) {
@@ -593,42 +908,138 @@ async function handleProjectListClick(event) {
   if (!button) {
     return;
   }
+
   const projectId = button.dataset.projectSelect;
   if (!projectId) {
     return;
   }
+
   state.selectedProjectId = projectId;
   state.selectedItemId = null;
   state.projectDraft = null;
   state.itemDraft = null;
-  setEditorFeedback(elements.projectFeedback, "Loading project...", "");
+  state.activeView = DEFAULT_VIEW;
+  state.navDrawerOpen = false;
+  state.detailPaneOpen = false;
+  setWorkspaceNotice("Loading project...", "");
+  renderAll();
+
   try {
     await loadProjectDetail(projectId, { force: false });
-    setEditorFeedback(elements.projectFeedback, "Project loaded.", "");
+    setWorkspaceNotice("Project loaded.", "");
   } catch (error) {
     console.error(error);
-    setEditorFeedback(elements.projectFeedback, error.message || "Could not load the project.", "is-error");
+    setWorkspaceNotice(error.message || "Could not load the project.", "is-error");
+  }
+
+  renderAll();
+}
+
+function handleViewSwitchClick(event) {
+  const button = event.target.closest("[data-view-switch]");
+  if (!button) {
+    return;
+  }
+
+  const nextView = button.dataset.viewSwitch;
+  if (!nextView || nextView === state.activeView) {
+    return;
+  }
+
+  state.activeView = nextView;
+  if (nextView === "settings") {
+    state.detailPaneOpen = false;
   }
   renderAll();
 }
 
-function handleBoardClick(event) {
-  const button = event.target.closest("[data-item-select]");
-  if (!button) {
+async function handleWorkspaceViewClick(event) {
+  const selectable = event.target.closest("[data-item-select]");
+  if (selectable) {
+    selectItem(selectable.dataset.itemSelect);
     return;
   }
-  const itemId = button.dataset.itemSelect;
-  if (!itemId || !state.selectedProjectId) {
+
+  const actionButton = event.target.closest("[data-action]");
+  if (!actionButton) {
     return;
   }
-  const detail = selectedProjectDetail();
-  const item = detail?.items?.find((candidate) => candidate.itemId === itemId);
-  if (!item) {
+
+  switch (actionButton.dataset.action) {
+    case "save-project":
+      await saveProjectDraft();
+      break;
+    case "delete-project":
+      await deleteSelectedProject();
+      break;
+    case "create-service-key":
+      await createServiceKey();
+      break;
+    case "revoke-service-key":
+      await revokeServiceKey(actionButton.dataset.serviceKeyId);
+      break;
+    default:
+      break;
+  }
+}
+
+function handleWorkspaceViewInput(event) {
+  const control = event.target;
+  const path = control.dataset.fieldPath;
+  const editor = control.dataset.editor;
+
+  if (!path || !editor) {
     return;
   }
-  state.selectedItemId = itemId;
-  state.itemDraft = clone(normalizeItemConfig(item));
-  renderWorkspace();
+
+  if (editor === "project" && state.projectDraft) {
+    setNestedValue(state.projectDraft, path, readControlValue(control));
+    return;
+  }
+
+  if (editor === "service-key" && state.serviceKeyDraft) {
+    setNestedValue(state.serviceKeyDraft, path, readControlValue(control));
+  }
+}
+
+async function handleDetailPaneClick(event) {
+  const actionButton = event.target.closest("[data-action]");
+  if (!actionButton) {
+    return;
+  }
+
+  switch (actionButton.dataset.action) {
+    case "close-item-editor":
+      closeDetailPane();
+      break;
+    case "save-item":
+      await saveItemDraft();
+      break;
+    case "delete-item":
+      await deleteSelectedItem();
+      break;
+    default:
+      break;
+  }
+}
+
+function handleDetailPaneInput(event) {
+  const control = event.target;
+  const path = control.dataset.fieldPath;
+  const editor = control.dataset.editor;
+
+  if (!path || editor !== "item" || !state.itemDraft) {
+    return;
+  }
+
+  setNestedValue(state.itemDraft, path, readControlValue(control));
+  if (path === "item_type") {
+    const options = itemParentOptions(selectedProjectDetail()?.items || [], state.itemDraft);
+    if (!options.some((option) => option.value === state.itemDraft.parent_id)) {
+      state.itemDraft.parent_id = "";
+    }
+    renderDetailPane();
+  }
 }
 
 function beginCreateProject() {
@@ -636,20 +1047,46 @@ function beginCreateProject() {
   state.selectedItemId = null;
   state.projectDraft = buildBlankProjectDraft();
   state.itemDraft = null;
-  setEditorFeedback(elements.projectFeedback, "New project draft opened.", "");
+  state.activeView = "settings";
+  state.navDrawerOpen = false;
+  state.detailPaneOpen = false;
+  setWorkspaceNotice("New project draft opened.", "");
   renderAll();
 }
 
 function beginCreateItem(itemType) {
   if (!state.selectedProjectId) {
-    setEditorFeedback(elements.projectFeedback, "Select a project first so the new item has a home.", "is-error");
+    setWorkspaceNotice("Select a project first so the new item has a home.", "is-error");
+    renderAll();
     return;
   }
+
   const parentId = suggestedParentId(itemType);
   state.itemDraft = buildBlankItemDraft(state.selectedProjectId, itemType, parentId);
   state.selectedItemId = null;
-  setEditorFeedback(elements.projectFeedback, `New ${formatItemType(itemType).toLowerCase()} draft opened.`, "");
-  renderWorkspace();
+  if (state.activeView === "settings") {
+    state.activeView = DEFAULT_VIEW;
+  }
+  openItemEditor();
+  setWorkspaceNotice(`New ${formatItemType(itemType).toLowerCase()} draft opened.`, "");
+  renderAll();
+}
+
+function selectItem(itemId) {
+  if (!itemId || !state.selectedProjectId) {
+    return;
+  }
+
+  const detail = selectedProjectDetail();
+  const item = detail?.items?.find((candidate) => candidate.itemId === itemId);
+  if (!item) {
+    return;
+  }
+
+  state.selectedItemId = itemId;
+  state.itemDraft = clone(normalizeItemConfig(item));
+  openItemEditor();
+  renderAll();
 }
 
 async function saveProjectDraft() {
@@ -665,7 +1102,9 @@ async function saveProjectDraft() {
   const method = creating ? "POST" : "PUT";
   const payload = { project: normalizeProjectDraftForSave(draft) };
 
-  setEditorFeedback(elements.projectFeedback, creating ? "Creating project..." : "Saving project...", "");
+  setWorkspaceNotice(creating ? "Creating project..." : "Saving project...", "");
+  renderAll();
+
   try {
     const response = await apiRequest(endpoint, {
       method,
@@ -676,12 +1115,16 @@ async function saveProjectDraft() {
     state.projectDetails[response.project.projectId] = response;
     ensureDrafts(response.project.projectId, { force: true });
     await loadProjects({ preserveSelection: true });
-    renderAll();
-    setEditorFeedback(elements.projectFeedback, creating ? "Project created." : "Project changes saved.", "is-success");
+    if (creating) {
+      state.activeView = DEFAULT_VIEW;
+    }
+    setWorkspaceNotice(creating ? "Project created." : "Project changes saved.", "is-success");
   } catch (error) {
     console.error(error);
-    setEditorFeedback(elements.projectFeedback, error.message || "Could not save the project.", "is-error");
+    setWorkspaceNotice(error.message || "Could not save the project.", "is-error");
   }
+
+  renderAll();
 }
 
 async function saveItemDraft() {
@@ -697,7 +1140,9 @@ async function saveItemDraft() {
   const method = creating ? "POST" : "PUT";
   const payload = { item: normalizeItemDraftForSave(draft) };
 
-  setEditorFeedback(elements.projectFeedback, creating ? "Creating item..." : "Saving item...", "");
+  setWorkspaceNotice(creating ? "Creating item..." : "Saving item...", "");
+  renderAll();
+
   try {
     const response = await apiRequest(endpoint, {
       method,
@@ -708,23 +1153,28 @@ async function saveItemDraft() {
     state.projectDetails[response.project.projectId] = response;
     ensureDrafts(response.project.projectId, { force: true });
     await loadProjects({ preserveSelection: true });
-    renderAll();
-    setEditorFeedback(elements.projectFeedback, creating ? "Work item created." : "Work item changes saved.", "is-success");
+    setWorkspaceNotice(creating ? "Work item created." : "Work item changes saved.", "is-success");
   } catch (error) {
     console.error(error);
-    setEditorFeedback(elements.projectFeedback, error.message || "Could not save the work item.", "is-error");
+    setWorkspaceNotice(error.message || "Could not save the work item.", "is-error");
   }
+
+  renderAll();
 }
 
 async function deleteSelectedProject() {
   if (!state.selectedProjectId) {
     return;
   }
+
   const confirmed = window.confirm("Delete this project and all of its work items?");
   if (!confirmed) {
     return;
   }
-  setEditorFeedback(elements.projectFeedback, "Deleting project...", "");
+
+  setWorkspaceNotice("Deleting project...", "");
+  renderAll();
+
   try {
     await apiRequest(`/api/agile/projects/${encodeURIComponent(state.selectedProjectId)}`, {
       method: "DELETE",
@@ -735,27 +1185,33 @@ async function deleteSelectedProject() {
     state.selectedItemId = null;
     state.projectDraft = null;
     state.itemDraft = null;
+    state.activeView = DEFAULT_VIEW;
     await loadProjects({ preserveSelection: false });
     if (state.selectedProjectId) {
       await loadProjectDetail(state.selectedProjectId, { force: true });
     }
-    renderAll();
-    setEditorFeedback(elements.projectFeedback, "Project deleted.", "is-success");
+    setWorkspaceNotice("Project deleted.", "is-success");
   } catch (error) {
     console.error(error);
-    setEditorFeedback(elements.projectFeedback, error.message || "Could not delete the project.", "is-error");
+    setWorkspaceNotice(error.message || "Could not delete the project.", "is-error");
   }
+
+  renderAll();
 }
 
 async function deleteSelectedItem() {
   if (!state.selectedProjectId || !state.selectedItemId) {
     return;
   }
+
   const confirmed = window.confirm("Delete this item and any child items under it?");
   if (!confirmed) {
     return;
   }
-  setEditorFeedback(elements.projectFeedback, "Deleting item...", "");
+
+  setWorkspaceNotice("Deleting item...", "");
+  renderAll();
+
   try {
     const response = await apiRequest(
       `/api/agile/projects/${encodeURIComponent(state.selectedProjectId)}/items/${encodeURIComponent(state.selectedItemId)}`,
@@ -768,12 +1224,68 @@ async function deleteSelectedItem() {
     state.selectedItemId = response.items?.[0]?.itemId || null;
     ensureDrafts(state.selectedProjectId, { force: true });
     await loadProjects({ preserveSelection: true });
-    renderAll();
-    setEditorFeedback(elements.projectFeedback, "Work item deleted.", "is-success");
+    if (state.viewport !== "desktop" && !state.selectedItemId) {
+      state.detailPaneOpen = false;
+    }
+    setWorkspaceNotice("Work item deleted.", "is-success");
   } catch (error) {
     console.error(error);
-    setEditorFeedback(elements.projectFeedback, error.message || "Could not delete the work item.", "is-error");
+    setWorkspaceNotice(error.message || "Could not delete the work item.", "is-error");
   }
+
+  renderAll();
+}
+
+async function createServiceKey() {
+  setServiceKeyNotice("Generating service key...", "");
+  renderAll();
+
+  try {
+    const response = await apiRequest("/api/service-keys", {
+      method: "POST",
+      body: JSON.stringify({
+        serviceKey: {
+          label: String(state.serviceKeyDraft.label || "").trim(),
+        },
+      }),
+    });
+    state.createdServiceKey = response.plaintextKey || null;
+    state.serviceKeyDraft = buildBlankServiceKeyDraft();
+    await loadServiceKeys();
+    setServiceKeyNotice("Service key created. Copy it now, then use it with X-API-Key.", "is-success");
+  } catch (error) {
+    console.error(error);
+    setServiceKeyNotice(error.message || "Could not create the service key.", "is-error");
+  }
+
+  renderAll();
+}
+
+async function revokeServiceKey(keyId) {
+  if (!keyId) {
+    return;
+  }
+
+  const confirmed = window.confirm("Revoke this service key? Any Codex project using it will stop working immediately.");
+  if (!confirmed) {
+    return;
+  }
+
+  setServiceKeyNotice("Revoking service key...", "");
+  renderAll();
+
+  try {
+    await apiRequest(`/api/service-keys/${encodeURIComponent(keyId)}`, {
+      method: "DELETE",
+    });
+    await loadServiceKeys();
+    setServiceKeyNotice("Service key revoked.", "is-success");
+  } catch (error) {
+    console.error(error);
+    setServiceKeyNotice(error.message || "Could not revoke the service key.", "is-error");
+  }
+
+  renderAll();
 }
 
 function ensureDrafts(projectId, options = {}) {
@@ -791,6 +1303,7 @@ function ensureDrafts(projectId, options = {}) {
   if (!items.length) {
     state.selectedItemId = null;
     state.itemDraft = null;
+    state.detailPaneOpen = false;
     return;
   }
 
@@ -855,6 +1368,12 @@ function buildBlankItemDraft(projectId, itemType = "story", parentId = "") {
     assignee_emails: [],
     tags: [],
     rank: 100,
+  };
+}
+
+function buildBlankServiceKeyDraft() {
+  return {
+    label: "",
   };
 }
 
@@ -983,73 +1502,56 @@ function suggestedParentId(itemType) {
   if (!state.selectedItemId) {
     return "";
   }
+
   const current = activeItemDraft() || normalizeItemConfig(
     selectedProjectDetail()?.items?.find((item) => item.itemId === state.selectedItemId),
   );
   if (!current?.item_type) {
     return "";
   }
+
   return canParentItem(current.item_type, itemType) ? current.item_id : "";
 }
 
-function renderField(label, path, value, options = {}) {
-  const {
-    type = "text",
-    valueType = type === "number" ? "int" : "string",
-    placeholder = "",
-    required = false,
-    step = "1",
-    disabled = false,
-    options: selectOptions = [],
-  } = options;
+function buildWorkItemMaps(items) {
+  const itemsById = new Map();
+  const childCountByParent = {};
 
-  const controlAttributes = [
-    `data-field-path="${escapeHtml(path)}"`,
-    `data-value-type="${escapeHtml(valueType)}"`,
-    placeholder ? `placeholder="${escapeHtml(placeholder)}"` : "",
-    required ? "required" : "",
-    disabled ? "disabled" : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
-
-  if (type === "textarea") {
-    return `
-      <label class="field field--full">
-        <span>${escapeHtml(label)}</span>
-        <textarea ${controlAttributes}>${escapeHtml(value ?? "")}</textarea>
-      </label>
-    `;
+  for (const item of items || []) {
+    itemsById.set(item.itemId, item);
+    if (item.parentId) {
+      childCountByParent[item.parentId] = (childCountByParent[item.parentId] || 0) + 1;
+    }
   }
 
-  if (type === "select") {
-    return `
-      <label class="field">
-        <span>${escapeHtml(label)}</span>
-        <select ${controlAttributes}>
-          ${selectOptions
-            .map((option) => `
-              <option value="${escapeHtml(option.value)}" ${String(option.value) === String(value ?? "") ? "selected" : ""}>
-                ${escapeHtml(option.label)}
-              </option>
-            `)
-            .join("")}
-        </select>
-      </label>
-    `;
+  return { itemsById, childCountByParent };
+}
+
+function buildPageSubtitle(projectSummary, projectDraft) {
+  if (projectSummary) {
+    const implementing = projectSummary.countsByStatus?.implementing || 0;
+    const count = projectSummary.itemCount || 0;
+    return projectSummary.description || `${count} work items | ${implementing} in progress.`;
   }
 
-  return `
-    <label class="field">
-      <span>${escapeHtml(label)}</span>
-      <input
-        type="${escapeHtml(type)}"
-        value="${escapeHtml(value ?? "")}"
-        ${type === "number" ? `step="${escapeHtml(step)}"` : ""}
-        ${controlAttributes}
-      >
-    </label>
-  `;
+  if (projectDraft) {
+    return projectDraft.description || "Configure the project, then move back into list or board execution views.";
+  }
+
+  return state.session?.app?.subtitle || "Hosted agile planning for projects, stories, and acceptance criteria.";
+}
+
+function renderBadge(label, tone = "neutral") {
+  const resolvedTone = ["accent", "success", "warning"].includes(tone) ? tone : "neutral";
+  return `<span class="badge ${resolvedTone !== "neutral" ? `badge--${resolvedTone}` : ""}">${escapeHtml(label)}</span>`;
+}
+
+function truncate(value, maxLength) {
+  const text = String(value || "");
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 }
 
 function formatProjectStatus(value) {
@@ -1075,6 +1577,31 @@ function formatItemStatus(value) {
 
 function formatPriority(value) {
   return String(value || "medium").replace(/^\w/, (character) => character.toUpperCase());
+}
+
+function formatServiceKeyStatus(value) {
+  return value === "revoked" ? "Revoked" : "Active";
+}
+
+function formatTimestamp(value) {
+  if (!value) {
+    return "unknown time";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return String(value);
+  }
+  return parsed.toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function serviceBaseUrl() {
+  return new URL("/service", window.location.origin).toString().replace(/\/$/, "");
 }
 
 function readControlValue(control) {
@@ -1144,41 +1671,121 @@ function joinList(values) {
   return (values || []).join(", ");
 }
 
-function setEditorFeedback(element, message, className) {
-  element.textContent = message || "";
-  element.className = `detail-feedback ${className || ""}`.trim();
+function setWorkspaceNotice(message, tone) {
+  state.workspaceNotice = {
+    message: message || "",
+    tone: tone || "",
+  };
+}
+
+function setServiceKeyNotice(message, tone) {
+  state.serviceKeyNotice = {
+    message: message || "",
+    tone: tone || "",
+  };
 }
 
 function setBanner(message) {
   elements.statusBanner.textContent = message || "";
 }
 
-function renderPill(label, options = {}) {
-  const modifiers = [];
-  if (options.status) {
-    modifiers.push(`pill--status-${String(options.status).replace(/[^a-z0-9-]/gi, "-").toLowerCase()}`);
-  }
-  if (options.type) {
-    modifiers.push(`pill--type-${String(options.type).replace(/[^a-z0-9-]/gi, "-").toLowerCase()}`);
-  }
-  if (options.priority) {
-    modifiers.push(`pill--priority-${String(options.priority).replace(/[^a-z0-9-]/gi, "-").toLowerCase()}`);
-  }
-  if (options.kind) {
-    modifiers.push(`pill--${String(options.kind).replace(/[^a-z0-9-]/gi, "-").toLowerCase()}`);
-  }
-  return `<span class="pill ${modifiers.join(" ")}">${escapeHtml(label)}</span>`;
-}
-
 function showAuthGate(message) {
+  state.navDrawerOpen = false;
+  state.detailPaneOpen = false;
+  document.body.dataset.overlayOpen = "false";
   setVisibility(elements.authGate, true, "grid");
   setVisibility(elements.portalShell, false, "grid");
   elements.authStatus.textContent = message;
 }
 
 function showPortal() {
+  document.body.dataset.overlayOpen = "false";
   setVisibility(elements.authGate, false, "grid");
-  setVisibility(elements.portalShell, true, "grid");
+  setVisibility(elements.portalShell, true, "");
+}
+
+function handleViewportResize() {
+  const nextViewport = getViewportCategory();
+  if (nextViewport === state.viewport) {
+    return;
+  }
+
+  const previousViewport = state.viewport;
+  state.viewport = nextViewport;
+  state.navDrawerOpen = false;
+
+  if (nextViewport === "desktop") {
+    state.detailPaneOpen = false;
+  } else if (previousViewport === "desktop") {
+    state.detailPaneOpen = Boolean(state.itemDraft);
+  }
+
+  renderAll();
+}
+
+function toggleNavigationDrawer() {
+  if (state.viewport === "desktop") {
+    return;
+  }
+
+  state.navDrawerOpen = !state.navDrawerOpen;
+  if (state.navDrawerOpen) {
+    state.detailPaneOpen = false;
+  }
+  renderAll();
+}
+
+function closeNavigationDrawer() {
+  if (!state.navDrawerOpen) {
+    return;
+  }
+
+  state.navDrawerOpen = false;
+  renderAll();
+}
+
+function closeDetailPane() {
+  if (state.viewport === "desktop" || !state.detailPaneOpen) {
+    return;
+  }
+
+  state.detailPaneOpen = false;
+  renderAll();
+}
+
+function closeOverlays() {
+  if (!isOverlayOpen()) {
+    return;
+  }
+
+  state.navDrawerOpen = false;
+  state.detailPaneOpen = false;
+  renderAll();
+}
+
+function openItemEditor() {
+  state.navDrawerOpen = false;
+  if (state.viewport !== "desktop") {
+    state.detailPaneOpen = true;
+  }
+}
+
+function shouldShowDetailOverlay() {
+  return state.viewport !== "desktop" && state.activeView !== "settings" && state.detailPaneOpen;
+}
+
+function isOverlayOpen() {
+  return state.navDrawerOpen || shouldShowDetailOverlay();
+}
+
+function getViewportCategory() {
+  if (window.innerWidth >= 1200) {
+    return "desktop";
+  }
+  if (window.innerWidth >= 768) {
+    return "tablet";
+  }
+  return "mobile";
 }
 
 function setVisibility(element, visible, displayValue) {

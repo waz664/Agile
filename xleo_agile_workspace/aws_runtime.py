@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+import secrets
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib.resources import files
 from typing import Any
@@ -27,6 +29,47 @@ class PortalUserContext:
     display_name: str
     groups: tuple[str, ...]
     is_super_admin: bool
+
+
+SERVICE_API_KEY_STATUSES = ("active", "revoked")
+SERVICE_API_KEY_PK = "CONFIG#SERVICE_API_KEYS"
+SERVICE_API_KEY_TOKEN_PATTERN = re.compile(r"^agws_([a-f0-9]{12})_([A-Za-z0-9\-_]{24,})$")
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceApiKeyRecord:
+    key_id: str
+    label: str
+    secret_hash: str
+    key_preview: str
+    status: str = "active"
+    created_at_utc: datetime = field(default_factory=lambda: datetime.now(UTC))
+    updated_at_utc: datetime = field(default_factory=lambda: datetime.now(UTC))
+    last_used_at_utc: datetime | None = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ServiceApiKeyRecord":
+        key_id = _required_text(payload.get("key_id", payload.get("keyId")), "key_id")
+        secret_hash = _required_text(payload.get("secret_hash", payload.get("secretHash")), "secret_hash")
+        status = _normalize_choice(
+            payload.get("status", "active"),
+            field_name="status",
+            allowed_values=SERVICE_API_KEY_STATUSES,
+        )
+        reference_time = datetime.now(UTC)
+        created_at = _coerce_datetime(payload.get("created_at_utc", payload.get("createdAtUtc")))
+        updated_at = _coerce_datetime(payload.get("updated_at_utc", payload.get("updatedAtUtc")))
+        last_used_at = _coerce_datetime(payload.get("last_used_at_utc", payload.get("lastUsedAtUtc")))
+        return cls(
+            key_id=key_id,
+            label=_optional_text(payload.get("label")) or "Codex integration",
+            secret_hash=secret_hash,
+            key_preview=_optional_text(payload.get("key_preview", payload.get("keyPreview"))) or f"agws_{key_id}_...",
+            status=status,
+            created_at_utc=created_at or reference_time,
+            updated_at_utc=updated_at or created_at or reference_time,
+            last_used_at_utc=last_used_at,
+        )
 
 
 class ConflictError(Exception):
@@ -64,6 +107,8 @@ def lambda_handler(event: dict[str, Any], _context: Any) -> dict[str, Any]:
             )
         if path.startswith("/api/"):
             return handle_api_request(event=event, body=body, method=method, path=path)
+        if path.startswith("/service/"):
+            return handle_service_api_request(event=event, body=body, method=method, path=path)
         if method == "GET" and "." not in path.rsplit("/", 1)[-1]:
             return _static_asset_response("index.html", "text/html; charset=utf-8")
         return response(404, {"ok": False, "error": f"Route not found: {method} {path}"})
@@ -98,12 +143,79 @@ def handle_api_request(
             },
         )
 
-    store = DynamoDbAgileStore(
+    store = _build_store()
+
+    if method == "GET" and path == "/api/service-keys":
+        require_portal_permission(user, "agile.manage")
+        return response(
+            200,
+            {
+                "ok": True,
+                "serviceKeys": [serialize_service_api_key(item) for item in store.list_service_api_keys()],
+                "time": datetime.now(UTC).isoformat(),
+            },
+        )
+
+    if method == "POST" and path == "/api/service-keys":
+        require_portal_permission(user, "agile.manage")
+        return response(200, create_service_api_key_from_payload(store=store, body=body))
+
+    service_key_id = _path_match(path, r"^/api/service-keys/([^/]+)$")
+    if service_key_id and method == "DELETE":
+        require_portal_permission(user, "agile.manage")
+        return response(200, revoke_service_api_key_from_payload(store=store, key_id=service_key_id))
+
+    return handle_agile_request(
+        event=event,
+        store=store,
+        user=user,
+        body=body,
+        method=method,
+        path=path,
+        path_prefix="/api",
+    )
+
+
+def handle_service_api_request(
+    *,
+    event: dict[str, Any],
+    body: dict[str, Any],
+    method: str,
+    path: str,
+) -> dict[str, Any]:
+    store = _build_store()
+    user = resolve_service_api_key_user(event=event, store=store)
+    return handle_agile_request(
+        event=event,
+        store=store,
+        user=user,
+        body=body,
+        method=method,
+        path=path,
+        path_prefix="/service",
+    )
+
+
+def _build_store() -> "DynamoDbAgileStore":
+    return DynamoDbAgileStore(
         table_name=os.environ["AGILE_STATE_TABLE"],
         region_name=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"),
     )
 
-    if method == "GET" and path == "/api/agile/projects":
+
+def handle_agile_request(
+    *,
+    event: dict[str, Any],
+    store: "DynamoDbAgileStore",
+    user: PortalUserContext,
+    body: dict[str, Any],
+    method: str,
+    path: str,
+    path_prefix: str,
+) -> dict[str, Any]:
+    escaped_prefix = re.escape(path_prefix)
+
+    if method == "GET" and path == f"{path_prefix}/agile/projects":
         include_archived = _query_string_value(event, "includeArchived", "include_archived") in {"true", "1", "yes"}
         limit = _optional_int(_query_string_value(event, "limit")) or 50
         projects = store.list_agile_projects(limit=max(1, limit), include_archived=include_archived)
@@ -120,14 +232,14 @@ def handle_api_request(
             },
         )
 
-    if method == "POST" and path == "/api/agile/projects":
+    if method == "POST" and path == f"{path_prefix}/agile/projects":
         require_portal_permission(user, "agile.manage")
         return response(
             200,
             upsert_agile_project_from_payload(store=store, body=body, allow_create=True),
         )
 
-    project_id = _path_match(path, r"^/api/agile/projects/([^/]+)$")
+    project_id = _path_match(path, rf"^{escaped_prefix}/agile/projects/([^/]+)$")
     if project_id:
         if method == "GET":
             return response(
@@ -157,7 +269,7 @@ def handle_api_request(
                 delete_agile_project_from_payload(store=store, project_id=project_id),
             )
 
-    project_items_id = _path_match(path, r"^/api/agile/projects/([^/]+)/items$")
+    project_items_id = _path_match(path, rf"^{escaped_prefix}/agile/projects/([^/]+)/items$")
     if project_items_id:
         if method == "GET":
             items = store.list_agile_items(project_items_id)
@@ -184,7 +296,7 @@ def handle_api_request(
                 ),
             )
 
-    item_match = re.match(r"^/api/agile/projects/([^/]+)/items/([^/]+)$", path)
+    item_match = re.match(rf"^{escaped_prefix}/agile/projects/([^/]+)/items/([^/]+)$", path)
     if item_match:
         project_id = unquote(item_match.group(1))
         item_id = unquote(item_match.group(2))
@@ -351,6 +463,31 @@ def resolve_portal_user(event: dict[str, Any]) -> PortalUserContext:
     )
 
 
+def resolve_service_api_key_user(
+    *,
+    event: dict[str, Any],
+    store: "DynamoDbAgileStore",
+) -> PortalUserContext:
+    token = _header_value(event, "x-api-key")
+    if not token:
+        raise PermissionError("Missing service API key.")
+
+    key_id, secret = _parse_service_api_key_token(token)
+    record = store.try_load_service_api_key(key_id)
+    if record is None or record.status != "active":
+        raise PermissionError("Service API key is invalid or disabled.")
+    if not secrets.compare_digest(record.secret_hash, _hash_service_api_key_secret(secret)):
+        raise PermissionError("Service API key is invalid or disabled.")
+
+    store.touch_service_api_key_usage(key_id)
+    return PortalUserContext(
+        email=f"service-key:{record.key_id}",
+        display_name=record.label,
+        groups=("service",),
+        is_super_admin=True,
+    )
+
+
 def require_portal_permission(user: PortalUserContext, permission_key: str) -> None:
     permissions = build_portal_permissions(user)
     permission_map = {
@@ -360,6 +497,85 @@ def require_portal_permission(user: PortalUserContext, permission_key: str) -> N
     resolved_key = permission_map.get(permission_key, permission_key)
     if not permissions.get(resolved_key):
         raise PermissionError("You do not have permission to manage agile projects in this workspace.")
+
+
+def serialize_service_api_key(
+    record: ServiceApiKeyRecord,
+    *,
+    include_secret_hash: bool = False,
+) -> dict[str, Any]:
+    payload = {
+        "keyId": record.key_id,
+        "label": record.label,
+        "status": record.status,
+        "keyPreview": record.key_preview,
+        "createdAtUtc": record.created_at_utc.isoformat(),
+        "updatedAtUtc": record.updated_at_utc.isoformat(),
+        "lastUsedAtUtc": record.last_used_at_utc.isoformat() if record.last_used_at_utc else None,
+    }
+    if include_secret_hash:
+        payload["secretHash"] = record.secret_hash
+    return payload
+
+
+def create_service_api_key_from_payload(
+    *,
+    store: "DynamoDbAgileStore",
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    payload = body.get("serviceKey") if isinstance(body.get("serviceKey"), dict) else body
+    if payload and not isinstance(payload, dict):
+        raise ValueError("Service key payload must be an object.")
+
+    key_label = _optional_text((payload or {}).get("label")) or "Codex integration"
+    key_id, plaintext_key, key_preview, secret_hash = _generate_service_api_key_material(store=store)
+    now = datetime.now(UTC)
+    record = ServiceApiKeyRecord(
+        key_id=key_id,
+        label=key_label,
+        status="active",
+        key_preview=key_preview,
+        secret_hash=secret_hash,
+        created_at_utc=now,
+        updated_at_utc=now,
+        last_used_at_utc=None,
+    )
+    store.save_service_api_key(record)
+    return {
+        "ok": True,
+        "serviceKey": serialize_service_api_key(record),
+        "plaintextKey": plaintext_key,
+    }
+
+
+def revoke_service_api_key_from_payload(
+    *,
+    store: "DynamoDbAgileStore",
+    key_id: str,
+) -> dict[str, Any]:
+    existing = store.load_service_api_key(key_id)
+    if existing.status == "revoked":
+        return {
+            "ok": True,
+            "serviceKey": serialize_service_api_key(existing),
+        }
+
+    now = datetime.now(UTC)
+    revoked = ServiceApiKeyRecord(
+        key_id=existing.key_id,
+        label=existing.label,
+        status="revoked",
+        key_preview=existing.key_preview,
+        secret_hash=existing.secret_hash,
+        created_at_utc=existing.created_at_utc,
+        updated_at_utc=now,
+        last_used_at_utc=existing.last_used_at_utc,
+    )
+    store.save_service_api_key(revoked)
+    return {
+        "ok": True,
+        "serviceKey": serialize_service_api_key(revoked),
+    }
 
 
 def summarize_agile_project(
@@ -420,6 +636,8 @@ def upsert_agile_project_from_payload(
     existing_project = store.try_load_agile_project(project_id)
     if existing_project is None and not allow_create:
         raise KeyError(f"Agile project not found: {project_id}")
+    if existing_project is not None and allow_create and expected_project_id is None:
+        raise ConflictError(f"Agile project already exists: {project_id}")
 
     now = datetime.now(UTC)
     project_payload["created_at_utc"] = (
@@ -463,6 +681,8 @@ def upsert_agile_work_item_from_payload(
     existing_item = store.try_load_agile_item(project_id, item_id)
     if existing_item is None and not allow_create:
         raise KeyError(f"Agile work item not found: {item_id}")
+    if existing_item is not None and allow_create and expected_item_id is None:
+        raise ConflictError(f"Agile work item already exists: {item_id}")
 
     now = datetime.now(UTC)
     all_items = store.list_agile_items(project_id)
@@ -545,6 +765,66 @@ class DynamoDbAgileStore:
         self._attr = Attr
         self._key = Key
 
+    def try_load_service_api_key(self, key_id: str) -> ServiceApiKeyRecord | None:
+        response = self._table.get_item(Key={"pk": SERVICE_API_KEY_PK, "sk": f"KEY#{key_id}"})
+        item = response.get("Item")
+        if not item:
+            return None
+        return ServiceApiKeyRecord.from_dict(json.loads(item["payloadJson"]))
+
+    def load_service_api_key(self, key_id: str) -> ServiceApiKeyRecord:
+        record = self.try_load_service_api_key(key_id)
+        if record is None:
+            raise KeyError(f"Service API key not found: {key_id}")
+        return record
+
+    def list_service_api_keys(self) -> tuple[ServiceApiKeyRecord, ...]:
+        query_kwargs = {
+            "KeyConditionExpression": self._key("pk").eq(SERVICE_API_KEY_PK)
+            & self._key("sk").begins_with("KEY#")
+        }
+        rows: list[dict[str, Any]] = []
+        while True:
+            response = self._table.query(**query_kwargs)
+            rows.extend(response.get("Items", []))
+            last_evaluated = response.get("LastEvaluatedKey")
+            if not last_evaluated:
+                break
+            query_kwargs["ExclusiveStartKey"] = last_evaluated
+
+        records = [ServiceApiKeyRecord.from_dict(json.loads(item["payloadJson"])) for item in rows]
+        records.sort(key=lambda item: (item.status != "active", item.label.lower(), item.key_id))
+        return tuple(records)
+
+    def save_service_api_key(self, record: ServiceApiKeyRecord) -> None:
+        self._table.put_item(
+            Item={
+                "pk": SERVICE_API_KEY_PK,
+                "sk": f"KEY#{record.key_id}",
+                "entityType": "service_api_key",
+                "keyId": record.key_id,
+                "keyStatus": record.status,
+                "label": record.label,
+                "updatedAtUtc": record.updated_at_utc.isoformat(),
+                "payloadJson": json.dumps(serialize_service_api_key(record, include_secret_hash=True)),
+            }
+        )
+
+    def touch_service_api_key_usage(self, key_id: str) -> None:
+        existing = self.load_service_api_key(key_id)
+        used_at = datetime.now(UTC)
+        updated = ServiceApiKeyRecord(
+            key_id=existing.key_id,
+            label=existing.label,
+            status=existing.status,
+            key_preview=existing.key_preview,
+            secret_hash=existing.secret_hash,
+            created_at_utc=existing.created_at_utc,
+            updated_at_utc=used_at,
+            last_used_at_utc=used_at,
+        )
+        self.save_service_api_key(updated)
+
     def try_load_agile_project(self, project_id: str) -> AgileProject | None:
         response = self._table.get_item(Key={"pk": f"PROJECT#{project_id}", "sk": "PROJECT"})
         item = response.get("Item")
@@ -607,11 +887,20 @@ class DynamoDbAgileStore:
         return item
 
     def list_agile_items(self, project_id: str) -> tuple[AgileWorkItem, ...]:
-        response = self._table.query(
-            KeyConditionExpression=self._key("pk").eq(f"PROJECT#{project_id}")
+        query_kwargs = {
+            "KeyConditionExpression": self._key("pk").eq(f"PROJECT#{project_id}")
             & self._key("sk").begins_with("ITEM#")
-        )
-        items = [AgileWorkItem.from_dict(json.loads(item["payloadJson"])) for item in response.get("Items", [])]
+        }
+        rows: list[dict[str, Any]] = []
+        while True:
+            response = self._table.query(**query_kwargs)
+            rows.extend(response.get("Items", []))
+            last_evaluated = response.get("LastEvaluatedKey")
+            if not last_evaluated:
+                break
+            query_kwargs["ExclusiveStartKey"] = last_evaluated
+
+        items = [AgileWorkItem.from_dict(json.loads(item["payloadJson"])) for item in rows]
         items.sort(key=lambda item: (item.rank, item.updated_at_utc.isoformat(), item.title.lower(), item.item_id))
         return tuple(items)
 
@@ -684,6 +973,32 @@ def _decode_event_body(event: dict[str, Any]) -> dict[str, Any]:
     raise ValueError("Request body must be a JSON object.")
 
 
+def _generate_service_api_key_material(
+    *,
+    store: "DynamoDbAgileStore",
+) -> tuple[str, str, str, str]:
+    for _ in range(10):
+        key_id = secrets.token_hex(6)
+        if store.try_load_service_api_key(key_id) is not None:
+            continue
+        secret = secrets.token_urlsafe(24)
+        plaintext_key = f"agws_{key_id}_{secret}"
+        key_preview = f"agws_{key_id}_..."
+        return key_id, plaintext_key, key_preview, _hash_service_api_key_secret(secret)
+    raise ConflictError("Could not allocate a unique service API key.")
+
+
+def _hash_service_api_key_secret(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _parse_service_api_key_token(token: str) -> tuple[str, str]:
+    match = SERVICE_API_KEY_TOKEN_PATTERN.match(str(token).strip())
+    if not match:
+        raise PermissionError("Service API key is invalid or disabled.")
+    return match.group(1), match.group(2)
+
+
 def _event_value(payload: dict[str, Any], *path: str) -> Any:
     current: Any = payload
     for key in path:
@@ -711,10 +1026,49 @@ def _query_string_value(event: dict[str, Any], *keys: str) -> str | None:
     return None
 
 
+def _header_value(event: dict[str, Any], *keys: str) -> str | None:
+    headers = event.get("headers") or {}
+    if not isinstance(headers, dict):
+        return None
+    normalized = {str(key).lower(): value for key, value in headers.items()}
+    for key in keys:
+        value = normalized.get(str(key).lower())
+        if value is not None:
+            return str(value)
+    return None
+
+
 def _optional_int(value: Any) -> int | None:
     if value in (None, ""):
         return None
     return int(value)
+
+
+def _coerce_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    normalized = str(value).strip().replace("Z", "+00:00")
+    if len(normalized) >= 5 and normalized[-5] in {"+", "-"} and ":" not in normalized[-5:]:
+        normalized = f"{normalized[:-2]}:{normalized[-2:]}"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _normalize_choice(
+    value: Any,
+    *,
+    field_name: str,
+    allowed_values: tuple[str, ...],
+) -> str:
+    text = _required_text(value, field_name).lower()
+    if text not in allowed_values:
+        raise ValueError(f"{field_name} must be one of {', '.join(allowed_values)}.")
+    return text
 
 
 def _required_text(value: Any, field_name: str) -> str:

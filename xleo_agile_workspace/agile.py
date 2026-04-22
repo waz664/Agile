@@ -177,25 +177,16 @@ def build_agile_board(
     items: tuple[AgileWorkItem, ...],
 ) -> dict[str, Any]:
     serialized_items = [serialize_agile_work_item(item) for item in _sort_items(items)]
-    items_by_id = {item["itemId"]: item for item in serialized_items}
-    for item in serialized_items:
-        item["children"] = []
-    roots: list[dict[str, Any]] = []
-    for item in serialized_items:
-        parent_id = item.get("parentId")
-        if parent_id and parent_id in items_by_id:
-            items_by_id[parent_id]["children"].append(item)
-        else:
-            roots.append(item)
+    roots = _build_item_forest(serialized_items)
 
     columns: list[dict[str, Any]] = []
     for status in AGILE_ITEM_STATUSES:
-        items_for_status = [item for item in roots if item["status"] == status]
+        items_for_status, item_count = _build_status_lane_items(serialized_items, status)
         columns.append(
             {
                 "status": status,
                 "label": _status_label(status),
-                "count": len(items_for_status),
+                "count": item_count,
                 "items": items_for_status,
             }
         )
@@ -206,6 +197,36 @@ def build_agile_board(
         "rootItems": roots,
         "itemCount": len(serialized_items),
     }
+
+
+def _build_item_forest(serialized_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    nodes = {item["itemId"]: {**item, "children": []} for item in serialized_items}
+    roots: list[dict[str, Any]] = []
+    for item in serialized_items:
+        node = nodes[item["itemId"]]
+        parent = nodes.get(item.get("parentId"))
+        if parent:
+            parent["children"].append(node)
+        else:
+            roots.append(node)
+    return roots
+
+
+def _build_status_lane_items(
+    serialized_items: list[dict[str, Any]],
+    status: str,
+) -> tuple[list[dict[str, Any]], int]:
+    lane_items = [item for item in serialized_items if item["status"] == status]
+    nodes = {item["itemId"]: {**item, "children": []} for item in lane_items}
+    roots: list[dict[str, Any]] = []
+    for item in lane_items:
+        node = nodes[item["itemId"]]
+        parent = nodes.get(item.get("parentId"))
+        if parent:
+            parent["children"].append(node)
+        else:
+            roots.append(node)
+    return roots, len(lane_items)
 
 
 def _sort_items(items: tuple[AgileWorkItem, ...]) -> tuple[AgileWorkItem, ...]:

@@ -21,6 +21,10 @@ class AssetTests(unittest.TestCase):
         self.assertIn("PUT /api/agile/projects/{projectId}", template)
         self.assertIn("DELETE /api/agile/projects/{projectId}", template)
         self.assertIn("POST /api/agile/projects/{projectId}/items", template)
+        self.assertIn("GET /api/service-keys", template)
+        self.assertIn("POST /api/service-keys", template)
+        self.assertIn("DELETE /api/service-keys/{keyId}", template)
+        self.assertIn("ANY /service/{proxy+}", template)
 
     def test_ui_and_scripts_reference_workspace_assets(self) -> None:
         ui_html = (ROOT / "ui" / "workspace-admin" / "index.html").read_text()
@@ -31,6 +35,9 @@ class AssetTests(unittest.TestCase):
         self.assertIn("XLEO Agile Workspace", ui_html)
         self.assertIn("/api/session", ui_js)
         self.assertIn("/api/agile/projects", ui_js)
+        self.assertIn("/api/service-keys", ui_js)
+        self.assertIn("X-API-Key", ui_js)
+        self.assertIn("Codex API keys", ui_html)
         self.assertIn("workspace-admin", publish_script)
         self.assertIn("New-CGIPUserPoolClient", deploy_script)
         self.assertIn("New-CGIPManagedLoginBranding", deploy_script)

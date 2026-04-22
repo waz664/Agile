@@ -11,9 +11,9 @@
     <div class="auth-panel">
       <div class="auth-copy-block">
         <p class="eyebrow">XLEO Agile Workspace</p>
-        <h1>Projects, stories, and acceptance criteria in one place.</h1>
+        <h1>Projects, delivery work, and acceptance criteria in one place.</h1>
         <p class="auth-copy">
-          Hosted in AWS so project planning stays available even when the workstation is off.
+          Sign in to open the hosted planning workspace and manage projects from anywhere.
         </p>
       </div>
       <div class="auth-actions">
@@ -25,14 +25,22 @@
 
   <div id="portal-shell" class="app-shell" hidden style="display: none;">
     <aside class="app-rail">
-      <div class="brand-stack">
+      <div class="rail-topbar">
+        <button id="nav-close-button" class="button button-subtle rail-close-button" type="button">Close</button>
+      </div>
+      <div class="brand-block">
         <p class="eyebrow">Hosted Workspace</p>
         <h1 id="brand-title">XLEO Agile Workspace</h1>
         <p id="brand-subtitle" class="brand-subtitle">AWS-hosted agile planning for projects, stories, and acceptance criteria.</p>
       </div>
 
       <section class="rail-section">
-        <p class="rail-label">Session</p>
+        <div class="section-header">
+          <div>
+            <p class="section-label">Session</p>
+            <h2 class="section-title">Workspace access</h2>
+          </div>
+        </div>
         <div class="rail-meta">
           <div class="rail-meta-row">
             <span>Role</span>
@@ -49,86 +57,60 @@
         </div>
       </section>
 
-      <section class="rail-section">
-        <div class="sheet-header">
+      <section class="rail-section rail-section--fill">
+        <div class="section-header">
           <div>
-            <p class="rail-label">Projects</p>
-            <h3 class="rail-heading">Workspace backlog</h3>
+            <p class="section-label">Projects</p>
+            <h2 class="section-title">Workspace backlog</h2>
           </div>
           <button id="project-create-button" class="button button-primary" type="button">New project</button>
         </div>
-        <div id="project-list" class="list-host"></div>
+        <div id="project-list" class="project-nav"></div>
       </section>
     </aside>
 
-    <div class="app-main">
-      <header class="app-header">
-        <div class="header-copy">
-          <p class="page-kicker">Hosted AWS workspace</p>
-          <h2 id="page-title">Agile board</h2>
+    <div class="workspace-shell">
+      <header class="workspace-header">
+        <div class="workspace-heading">
+          <p class="eyebrow">Hosted AWS workspace</p>
+          <h2 id="page-title">Agile workspace</h2>
+          <p id="page-subtitle" class="page-subtitle">Select a project to review work items and delivery status.</p>
         </div>
-        <div class="header-actions">
-          <p id="status-banner" class="status-banner">Loading workspace data...</p>
+
+        <div class="workspace-toolbar">
+          <button id="nav-toggle-button" class="button button-subtle nav-toggle-button" type="button">Menu</button>
+
+          <div id="view-switcher" class="view-switcher" role="tablist" aria-label="Workspace view">
+            <button class="view-switcher-button" type="button" data-view-switch="list">List</button>
+            <button class="view-switcher-button" type="button" data-view-switch="board">Board</button>
+            <button class="view-switcher-button" type="button" data-view-switch="settings">Settings</button>
+          </div>
+
+          <div id="item-create-actions" class="toolbar-group">
+            <button id="item-create-epic" class="button" type="button">New epic</button>
+            <button id="item-create-story" class="button button-primary" type="button">New story</button>
+            <button id="item-create-task" class="button" type="button">New task</button>
+          </div>
+
           <button id="refresh-button" class="button" type="button">Refresh</button>
-          <button id="sign-out-button" class="button button-ghost" type="button">Sign Out</button>
+          <button id="sign-out-button" class="button button-subtle" type="button">Sign Out</button>
         </div>
       </header>
 
-      <main class="app-content">
-        <section id="kpi-strip" class="kpi-strip"></section>
+      <div class="workspace-statusbar">
+        <p id="status-banner" class="status-banner">Loading workspace data...</p>
+      </div>
 
-        <section class="stage" style="display: grid;">
-          <div class="stage-columns stage-columns--split">
-            <section class="sheet sheet--detail">
-              <div class="sheet-header">
-                <div>
-                  <p class="section-label">Board</p>
-                  <h3 id="project-title">Select a project</h3>
-                </div>
-                <div class="inline-actions">
-                  <button id="item-create-epic" class="button" type="button">New epic</button>
-                  <button id="item-create-story" class="button button-primary" type="button">New story</button>
-                  <button id="item-create-task" class="button" type="button">New task</button>
-                </div>
-              </div>
+      <section id="project-summary-strip" class="summary-strip"></section>
 
-              <p id="project-feedback" class="detail-feedback"></p>
-              <div id="project-summary" class="summary-grid"></div>
-              <div id="project-board" class="agile-board"></div>
+      <div class="workspace-body">
+        <main class="workspace-main">
+          <div id="workspace-view"></div>
+        </main>
+        <aside id="detail-pane" class="detail-pane"></aside>
+      </div>
 
-              <div class="stage-columns stage-columns--detail-lower">
-                <div class="subsection">
-                  <div class="subsection-header">
-                    <div>
-                      <p class="section-label">Project editor</p>
-                      <h4>Project settings</h4>
-                    </div>
-                    <div class="inline-actions">
-                      <button id="project-save-button" class="button button-primary" type="button">Save project</button>
-                      <button id="project-delete-button" class="button" type="button">Delete project</button>
-                    </div>
-                  </div>
-                  <div id="project-editor" class="editor-host"></div>
-                </div>
-
-                <div class="subsection">
-                  <div class="subsection-header">
-                    <div>
-                      <p class="section-label">Item editor</p>
-                      <h4 id="item-editor-title">Select an item</h4>
-                    </div>
-                    <div class="inline-actions">
-                      <button id="item-save-button" class="button button-primary" type="button">Save item</button>
-                      <button id="item-delete-button" class="button" type="button">Delete item</button>
-                    </div>
-                  </div>
-                  <div id="item-editor" class="editor-host"></div>
-                </div>
-              </div>
-            </section>
-          </div>
-        </section>
-      </main>
+      <button id="shell-backdrop" class="shell-backdrop" type="button" aria-label="Close overlay"></button>
     </div>
   </div>
 

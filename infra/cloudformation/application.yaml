@@ -315,6 +315,40 @@ Resources:
       AuthorizerId: !Ref PortalApiAuthorizer
       Target: !Sub 'integrations/${PortalApiIntegration}'
 
+  PortalServiceKeysRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: GET /api/service-keys
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalServiceKeysCreateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: POST /api/service-keys
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalServiceKeyDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: DELETE /api/service-keys/{keyId}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalServiceProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: ANY /service/{proxy+}
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
   PortalStage:
     Type: AWS::ApiGatewayV2::Stage
     Properties:
