@@ -66,4 +66,5 @@ Super admins can generate and revoke service API keys in the hosted UI. Those ke
 
 - Admin management endpoints stay under the Cognito-protected `/api/service-keys` routes.
 - Service integrations call the unauthenticated `/service/agile/...` routes and must send `X-API-Key: <key>`.
-- Service keys currently have full workspace read/write/delete access until revoked.
+- Service keys can be left with full workspace access or scoped to one or more project ids.
+- Scoped service keys can only list, read, create, update, or delete records inside their allowed projects.

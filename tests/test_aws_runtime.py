@@ -297,6 +297,7 @@ class AwsRuntimeTests(unittest.TestCase):
                 {
                     "serviceKey": {
                         "label": "Planning Bot",
+                        "allowedProjectIds": ["workspace-refresh"],
                     }
                 }
             ),
@@ -333,6 +334,7 @@ class AwsRuntimeTests(unittest.TestCase):
         self.assertTrue(create_payload["ok"])
         self.assertEqual(create_payload["serviceKey"]["keyId"], "abc123def456")
         self.assertEqual(create_payload["serviceKey"]["label"], "Planning Bot")
+        self.assertEqual(create_payload["serviceKey"]["allowedProjectIds"], ["workspace-refresh"])
         self.assertEqual(
             create_payload["plaintextKey"],
             "agws_abc123def456_integrationsecretvalue123456",
@@ -418,6 +420,7 @@ class AwsRuntimeTests(unittest.TestCase):
                 status="active",
                 key_preview="agws_abc123def456_...",
                 secret_hash=hashlib.sha256("integrationsecretvalue123456".encode("utf-8")).hexdigest(),
+                allowed_project_ids=("workspace-refresh",),
                 created_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
                 updated_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
             )
@@ -447,6 +450,111 @@ class AwsRuntimeTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["projects"][0]["projectId"], "workspace-refresh")
         self.assertIsNotNone(store.load_service_api_key("abc123def456").last_used_at_utc)
+
+    @patch("xleo_agile_workspace.aws_runtime.DynamoDbAgileStore")
+    def test_lambda_handler_filters_service_key_projects_by_scope(self, store_class) -> None:
+        store = _InMemoryAgileStore()
+        store.save_agile_project(
+            AgileProject(
+                project_id="workspace-refresh",
+                name="Workspace Refresh",
+                description="Track the standalone agile workspace move.",
+                created_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+                updated_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+            )
+        )
+        store.save_agile_project(
+            AgileProject(
+                project_id="other-project",
+                name="Other Project",
+                description="Something else.",
+                created_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+                updated_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+            )
+        )
+        store.save_service_api_key(
+            ServiceApiKeyRecord(
+                key_id="abc123def456",
+                label="Planning Bot",
+                status="active",
+                key_preview="agws_abc123def456_...",
+                secret_hash=hashlib.sha256("integrationsecretvalue123456".encode("utf-8")).hexdigest(),
+                allowed_project_ids=("workspace-refresh",),
+                created_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+                updated_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+            )
+        )
+        store_class.return_value = store
+        event = {
+            "rawPath": "/service/agile/projects",
+            "headers": {
+                "x-api-key": "agws_abc123def456_integrationsecretvalue123456",
+            },
+            "requestContext": {
+                "http": {"method": "GET"},
+            },
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "AGILE_STATE_TABLE": "xleo-agile-workspace-dev-state",
+            },
+            clear=False,
+        ):
+            result = lambda_handler(event, None)
+
+        payload = json.loads(result["body"])
+        self.assertEqual(result["statusCode"], 200)
+        self.assertEqual([project["projectId"] for project in payload["projects"]], ["workspace-refresh"])
+
+    @patch("xleo_agile_workspace.aws_runtime.DynamoDbAgileStore")
+    def test_lambda_handler_rejects_scoped_service_key_for_other_project(self, store_class) -> None:
+        store = _InMemoryAgileStore()
+        store.save_agile_project(
+            AgileProject(
+                project_id="workspace-refresh",
+                name="Workspace Refresh",
+                description="Track the standalone agile workspace move.",
+                created_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+                updated_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+            )
+        )
+        store.save_service_api_key(
+            ServiceApiKeyRecord(
+                key_id="abc123def456",
+                label="Planning Bot",
+                status="active",
+                key_preview="agws_abc123def456_...",
+                secret_hash=hashlib.sha256("integrationsecretvalue123456".encode("utf-8")).hexdigest(),
+                allowed_project_ids=("workspace-refresh",),
+                created_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+                updated_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+            )
+        )
+        store_class.return_value = store
+        event = {
+            "rawPath": "/service/agile/projects/other-project",
+            "headers": {
+                "x-api-key": "agws_abc123def456_integrationsecretvalue123456",
+            },
+            "requestContext": {
+                "http": {"method": "GET"},
+            },
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "AGILE_STATE_TABLE": "xleo-agile-workspace-dev-state",
+            },
+            clear=False,
+        ):
+            result = lambda_handler(event, None)
+
+        payload = json.loads(result["body"])
+        self.assertEqual(result["statusCode"], 403)
+        self.assertIn("not allowed to access that project", payload["error"])
 
     @patch("xleo_agile_workspace.aws_runtime.DynamoDbAgileStore")
     def test_lambda_handler_rejects_service_route_without_service_api_key(self, store_class) -> None:
@@ -559,6 +667,7 @@ class _InMemoryAgileStore:
             status=existing.status,
             key_preview=existing.key_preview,
             secret_hash=existing.secret_hash,
+            allowed_project_ids=existing.allowed_project_ids,
             created_at_utc=existing.created_at_utc,
             updated_at_utc=used_at,
             last_used_at_utc=used_at,

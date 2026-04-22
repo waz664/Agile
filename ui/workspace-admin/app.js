@@ -533,6 +533,11 @@ function renderServiceAccessSection() {
             editor: "service-key",
             placeholder: "Personal Codex automation",
           })}
+          ${renderField("Allowed project IDs", "allowed_project_ids", joinList(state.serviceKeyDraft.allowed_project_ids || []), {
+            editor: "service-key",
+            valueType: "csv",
+            placeholder: "Leave blank for full workspace access, or enter ids like hockeymanageragent",
+          })}
           ${state.createdServiceKey ? `
             <div class="service-key-callout">
               <div class="stack">
@@ -749,6 +754,9 @@ function renderBoardCard(item, itemMaps) {
 }
 
 function renderServiceKeyRow(serviceKey) {
+  const scopeText = Array.isArray(serviceKey.allowedProjectIds) && serviceKey.allowedProjectIds.length
+    ? `Projects: ${serviceKey.allowedProjectIds.join(", ")}`
+    : "Projects: full workspace";
   return `
     <div class="service-key-row">
       <div class="service-key-row__body">
@@ -758,6 +766,7 @@ function renderServiceKeyRow(serviceKey) {
           ${escapeHtml(`Created ${formatTimestamp(serviceKey.createdAtUtc)}`)}
           ${serviceKey.lastUsedAtUtc ? ` | ${escapeHtml(`Last used ${formatTimestamp(serviceKey.lastUsedAtUtc)}`)}` : ""}
         </div>
+        <div class="service-key-row__meta">${escapeHtml(scopeText)}</div>
       </div>
       <div class="service-key-row__meta">
         ${renderBadge(formatServiceKeyStatus(serviceKey.status), serviceKey.status === "active" ? "accent" : "neutral")}
@@ -1246,6 +1255,7 @@ async function createServiceKey() {
       body: JSON.stringify({
         serviceKey: {
           label: String(state.serviceKeyDraft.label || "").trim(),
+          allowedProjectIds: normalizeStringArray(state.serviceKeyDraft.allowed_project_ids || []),
         },
       }),
     });
@@ -1374,6 +1384,7 @@ function buildBlankItemDraft(projectId, itemType = "story", parentId = "") {
 function buildBlankServiceKeyDraft() {
   return {
     label: "",
+    allowed_project_ids: [],
   };
 }
 

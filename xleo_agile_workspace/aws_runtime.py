@@ -29,6 +29,7 @@ class PortalUserContext:
     display_name: str
     groups: tuple[str, ...]
     is_super_admin: bool
+    allowed_project_ids: tuple[str, ...] = ()
 
 
 SERVICE_API_KEY_STATUSES = ("active", "revoked")
@@ -42,6 +43,7 @@ class ServiceApiKeyRecord:
     label: str
     secret_hash: str
     key_preview: str
+    allowed_project_ids: tuple[str, ...] = ()
     status: str = "active"
     created_at_utc: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at_utc: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -56,6 +58,9 @@ class ServiceApiKeyRecord:
             field_name="status",
             allowed_values=SERVICE_API_KEY_STATUSES,
         )
+        allowed_project_ids = _normalize_project_id_list(
+            payload.get("allowed_project_ids", payload.get("allowedProjectIds"))
+        )
         reference_time = datetime.now(UTC)
         created_at = _coerce_datetime(payload.get("created_at_utc", payload.get("createdAtUtc")))
         updated_at = _coerce_datetime(payload.get("updated_at_utc", payload.get("updatedAtUtc")))
@@ -65,6 +70,7 @@ class ServiceApiKeyRecord:
             label=_optional_text(payload.get("label")) or "Codex integration",
             secret_hash=secret_hash,
             key_preview=_optional_text(payload.get("key_preview", payload.get("keyPreview"))) or f"agws_{key_id}_...",
+            allowed_project_ids=allowed_project_ids,
             status=status,
             created_at_utc=created_at or reference_time,
             updated_at_utc=updated_at or created_at or reference_time,
@@ -218,7 +224,12 @@ def handle_agile_request(
     if method == "GET" and path == f"{path_prefix}/agile/projects":
         include_archived = _query_string_value(event, "includeArchived", "include_archived") in {"true", "1", "yes"}
         limit = _optional_int(_query_string_value(event, "limit")) or 50
-        projects = store.list_agile_projects(limit=max(1, limit), include_archived=include_archived)
+        store_limit = max(1, limit) if not user.allowed_project_ids else 500
+        projects = tuple(
+            project
+            for project in store.list_agile_projects(limit=store_limit, include_archived=include_archived)
+            if _user_can_access_project(user, project.project_id)
+        )[: max(1, limit)]
         return response(
             200,
             {
@@ -234,6 +245,7 @@ def handle_agile_request(
 
     if method == "POST" and path == f"{path_prefix}/agile/projects":
         require_portal_permission(user, "agile.manage")
+        _ensure_project_access(user, _project_id_from_body(body))
         return response(
             200,
             upsert_agile_project_from_payload(store=store, body=body, allow_create=True),
@@ -241,6 +253,7 @@ def handle_agile_request(
 
     project_id = _path_match(path, rf"^{escaped_prefix}/agile/projects/([^/]+)$")
     if project_id:
+        _ensure_project_access(user, project_id)
         if method == "GET":
             return response(
                 200,
@@ -271,6 +284,7 @@ def handle_agile_request(
 
     project_items_id = _path_match(path, rf"^{escaped_prefix}/agile/projects/([^/]+)/items$")
     if project_items_id:
+        _ensure_project_access(user, project_items_id)
         if method == "GET":
             items = store.list_agile_items(project_items_id)
             return response(
@@ -300,6 +314,7 @@ def handle_agile_request(
     if item_match:
         project_id = unquote(item_match.group(1))
         item_id = unquote(item_match.group(2))
+        _ensure_project_access(user, project_id)
         if method == "GET":
             item = store.load_agile_item(project_id, item_id)
             return response(
@@ -428,6 +443,7 @@ def build_portal_permissions(user: PortalUserContext) -> dict[str, Any]:
     return {
         "agileView": True,
         "agileManage": user.is_super_admin,
+        "allowedProjectIds": list(user.allowed_project_ids),
     }
 
 
@@ -485,6 +501,7 @@ def resolve_service_api_key_user(
         display_name=record.label,
         groups=("service",),
         is_super_admin=True,
+        allowed_project_ids=record.allowed_project_ids,
     )
 
 
@@ -509,6 +526,7 @@ def serialize_service_api_key(
         "label": record.label,
         "status": record.status,
         "keyPreview": record.key_preview,
+        "allowedProjectIds": list(record.allowed_project_ids),
         "createdAtUtc": record.created_at_utc.isoformat(),
         "updatedAtUtc": record.updated_at_utc.isoformat(),
         "lastUsedAtUtc": record.last_used_at_utc.isoformat() if record.last_used_at_utc else None,
@@ -528,6 +546,9 @@ def create_service_api_key_from_payload(
         raise ValueError("Service key payload must be an object.")
 
     key_label = _optional_text((payload or {}).get("label")) or "Codex integration"
+    allowed_project_ids = _normalize_project_id_list(
+        (payload or {}).get("allowed_project_ids", (payload or {}).get("allowedProjectIds"))
+    )
     key_id, plaintext_key, key_preview, secret_hash = _generate_service_api_key_material(store=store)
     now = datetime.now(UTC)
     record = ServiceApiKeyRecord(
@@ -536,6 +557,7 @@ def create_service_api_key_from_payload(
         status="active",
         key_preview=key_preview,
         secret_hash=secret_hash,
+        allowed_project_ids=allowed_project_ids,
         created_at_utc=now,
         updated_at_utc=now,
         last_used_at_utc=None,
@@ -567,6 +589,7 @@ def revoke_service_api_key_from_payload(
         status="revoked",
         key_preview=existing.key_preview,
         secret_hash=existing.secret_hash,
+        allowed_project_ids=existing.allowed_project_ids,
         created_at_utc=existing.created_at_utc,
         updated_at_utc=now,
         last_used_at_utc=existing.last_used_at_utc,
@@ -819,6 +842,7 @@ class DynamoDbAgileStore:
             status=existing.status,
             key_preview=existing.key_preview,
             secret_hash=existing.secret_hash,
+            allowed_project_ids=existing.allowed_project_ids,
             created_at_utc=existing.created_at_utc,
             updated_at_utc=used_at,
             last_used_at_utc=used_at,
@@ -999,6 +1023,28 @@ def _parse_service_api_key_token(token: str) -> tuple[str, str]:
     return match.group(1), match.group(2)
 
 
+def _project_id_from_body(body: dict[str, Any]) -> str:
+    payload = body.get("project") if isinstance(body.get("project"), dict) else body
+    if not isinstance(payload, dict):
+        raise ValueError("Project payload must be an object.")
+    explicit_id = _optional_text(payload.get("project_id", payload.get("projectId")))
+    if explicit_id:
+        return _slugify(explicit_id)
+    return _slugify(_required_text(payload.get("name"), "name"))
+
+
+def _user_can_access_project(user: PortalUserContext, project_id: str) -> bool:
+    if not user.allowed_project_ids:
+        return True
+    return project_id in user.allowed_project_ids
+
+
+def _ensure_project_access(user: PortalUserContext, project_id: str) -> None:
+    if _user_can_access_project(user, project_id):
+        return
+    raise PermissionError("This service API key is not allowed to access that project.")
+
+
 def _event_value(payload: dict[str, Any], *path: str) -> Any:
     current: Any = payload
     for key in path:
@@ -1088,6 +1134,30 @@ def _optional_text(value: Any) -> str | None:
 def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slug or "item"
+
+
+def _normalize_project_id_list(value: Any) -> tuple[str, ...]:
+    if value in (None, ""):
+        return ()
+    if isinstance(value, str):
+        values = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        raise ValueError("allowed_project_ids must be a list of project ids.")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        text = _optional_text(raw)
+        if not text:
+            continue
+        project_id = _slugify(text)
+        if project_id in seen:
+            continue
+        normalized.append(project_id)
+        seen.add(project_id)
+    return tuple(normalized)
 
 
 def _parse_email_set(value: str) -> set[str]:
