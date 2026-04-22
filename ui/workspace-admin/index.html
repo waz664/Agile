@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XLEO Agile Workspace</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <section id="auth-gate" class="auth-gate" hidden style="display: none;">
+    <div class="auth-panel">
+      <div class="auth-copy-block">
+        <p class="eyebrow">XLEO Agile Workspace</p>
+        <h1>Projects, stories, and acceptance criteria in one place.</h1>
+        <p class="auth-copy">
+          Hosted in AWS so project planning stays available even when the workstation is off.
+        </p>
+      </div>
+      <div class="auth-actions">
+        <button id="sign-in-button" class="button button-primary" type="button">Sign In</button>
+        <p id="auth-status" class="auth-status">Checking your workspace session...</p>
+      </div>
+    </div>
+  </section>
+
+  <div id="portal-shell" class="app-shell" hidden style="display: none;">
+    <aside class="app-rail">
+      <div class="brand-stack">
+        <p class="eyebrow">Hosted Workspace</p>
+        <h1 id="brand-title">XLEO Agile Workspace</h1>
+        <p id="brand-subtitle" class="brand-subtitle">AWS-hosted agile planning for projects, stories, and acceptance criteria.</p>
+      </div>
+
+      <section class="rail-section">
+        <p class="rail-label">Session</p>
+        <div class="rail-meta">
+          <div class="rail-meta-row">
+            <span>Role</span>
+            <strong id="session-role">Loading role...</strong>
+          </div>
+          <div class="rail-meta-row">
+            <span>User</span>
+            <strong id="session-name">Checking access...</strong>
+          </div>
+          <div class="rail-meta-row">
+            <span>Email</span>
+            <strong id="session-email">...</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="rail-section">
+        <div class="sheet-header">
+          <div>
+            <p class="rail-label">Projects</p>
+            <h3 class="rail-heading">Workspace backlog</h3>
+          </div>
+          <button id="project-create-button" class="button button-primary" type="button">New project</button>
+        </div>
+        <div id="project-list" class="list-host"></div>
+      </section>
+    </aside>
+
+    <div class="app-main">
+      <header class="app-header">
+        <div class="header-copy">
+          <p class="page-kicker">Hosted AWS workspace</p>
+          <h2 id="page-title">Agile board</h2>
+        </div>
+        <div class="header-actions">
+          <p id="status-banner" class="status-banner">Loading workspace data...</p>
+          <button id="refresh-button" class="button" type="button">Refresh</button>
+          <button id="sign-out-button" class="button button-ghost" type="button">Sign Out</button>
+        </div>
+      </header>
+
+      <main class="app-content">
+        <section id="kpi-strip" class="kpi-strip"></section>
+
+        <section class="stage" style="display: grid;">
+          <div class="stage-columns stage-columns--split">
+            <section class="sheet sheet--detail">
+              <div class="sheet-header">
+                <div>
+                  <p class="section-label">Board</p>
+                  <h3 id="project-title">Select a project</h3>
+                </div>
+                <div class="inline-actions">
+                  <button id="item-create-epic" class="button" type="button">New epic</button>
+                  <button id="item-create-story" class="button button-primary" type="button">New story</button>
+                  <button id="item-create-task" class="button" type="button">New task</button>
+                </div>
+              </div>
+
+              <p id="project-feedback" class="detail-feedback"></p>
+              <div id="project-summary" class="summary-grid"></div>
+              <div id="project-board" class="agile-board"></div>
+
+              <div class="stage-columns stage-columns--detail-lower">
+                <div class="subsection">
+                  <div class="subsection-header">
+                    <div>
+                      <p class="section-label">Project editor</p>
+                      <h4>Project settings</h4>
+                    </div>
+                    <div class="inline-actions">
+                      <button id="project-save-button" class="button button-primary" type="button">Save project</button>
+                      <button id="project-delete-button" class="button" type="button">Delete project</button>
+                    </div>
+                  </div>
+                  <div id="project-editor" class="editor-host"></div>
+                </div>
+
+                <div class="subsection">
+                  <div class="subsection-header">
+                    <div>
+                      <p class="section-label">Item editor</p>
+                      <h4 id="item-editor-title">Select an item</h4>
+                    </div>
+                    <div class="inline-actions">
+                      <button id="item-save-button" class="button button-primary" type="button">Save item</button>
+                      <button id="item-delete-button" class="button" type="button">Delete item</button>
+                    </div>
+                  </div>
+                  <div id="item-editor" class="editor-host"></div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script src="/app-config.js" type="text/javascript"></script>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

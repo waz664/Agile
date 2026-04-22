@@ -1,0 +1,419 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS-hosted agile workspace with Cognito auth, Lambda runtime, DynamoDB storage, and optional custom domain.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: xleo-agile-workspace
+    AllowedPattern: '^[a-z0-9-]+$'
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedPattern: '^[a-z0-9-]+$'
+  PortalAllowedEmails:
+    Type: String
+    Default: ''
+  PortalSuperAdminEmails:
+    Type: String
+    Default: ''
+  PortalTitle:
+    Type: String
+    Default: XLEO Agile Workspace
+  PortalSubtitle:
+    Type: String
+    Default: AWS-hosted agile planning for projects, stories, and acceptance criteria.
+  PortalUserPoolId:
+    Type: String
+  PortalUserPoolClientId:
+    Type: String
+  PortalCognitoDomain:
+    Type: String
+    Default: ''
+  CustomDomainName:
+    Type: String
+    Default: ''
+  HostedZoneId:
+    Type: String
+    Default: ''
+  PortalCertificateArn:
+    Type: String
+    Default: ''
+  ManageCustomDomainRecords:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  CreateCustomDomain: !Not [!Equals [!Ref CustomDomainName, '']]
+  UseExistingPortalCertificate: !Not [!Equals [!Ref PortalCertificateArn, '']]
+  CreateManagedPortalCertificate: !And
+    - !Condition CreateCustomDomain
+    - !Not [!Condition UseExistingPortalCertificate]
+    - !Not [!Equals [!Ref HostedZoneId, '']]
+  ManagePortalDnsRecords: !And
+    - !Condition CreateCustomDomain
+    - !Equals [!Ref ManageCustomDomainRecords, 'true']
+    - !Not [!Equals [!Ref HostedZoneId, '']]
+
+Resources:
+  AgileStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-state'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  RuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-runtime-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-${EnvironmentName}-runtime-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AgileStateTable.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  RuntimeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-runtime'
+      Role: !GetAtt RuntimeRole.Arn
+      Handler: index.handler
+      Runtime: python3.11
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT_NAME: !Ref EnvironmentName
+          AGILE_STATE_TABLE: !Ref AgileStateTable
+          PORTAL_ALLOWED_EMAILS: !Ref PortalAllowedEmails
+          PORTAL_SUPER_ADMIN_EMAILS: !Ref PortalSuperAdminEmails
+          PORTAL_TITLE: !Ref PortalTitle
+          PORTAL_SUBTITLE: !Ref PortalSubtitle
+          PORTAL_COGNITO_CLIENT_ID: !Ref PortalUserPoolClientId
+          PORTAL_COGNITO_DOMAIN: !Ref PortalCognitoDomain
+      Code:
+        ZipFile: |
+          import json
+          def handler(event, context):
+              return {
+                  "statusCode": 501,
+                  "headers": {
+                      "content-type": "application/json",
+                      "cache-control": "no-store",
+                  },
+                  "body": json.dumps({
+                      "ok": False,
+                      "error": "Runtime code has not been published yet.",
+                  }),
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  RuntimeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${RuntimeFunction}'
+      RetentionInDays: 14
+
+  PortalApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-api'
+      ProtocolType: HTTP
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+
+  PortalApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PortalApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RuntimeFunction.Arn}/invocations'
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+
+  PortalApiAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref PortalApi
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Audience:
+          - !Ref PortalUserPoolClientId
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${PortalUserPoolId}'
+      Name: !Sub '${ProjectName}-${EnvironmentName}-jwt'
+
+  PortalRootRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: GET /
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalStaticProxyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: GET /{proxy+}
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalHealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: GET /health
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalSessionRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: GET /api/session
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalProjectsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: GET /api/agile/projects
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalProjectsCreateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: POST /api/agile/projects
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalProjectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: GET /api/agile/projects/{projectId}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalProjectUpdateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: PUT /api/agile/projects/{projectId}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalProjectDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: DELETE /api/agile/projects/{projectId}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalItemsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: GET /api/agile/projects/{projectId}/items
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalItemsCreateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: POST /api/agile/projects/{projectId}/items
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalItemRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: GET /api/agile/projects/{projectId}/items/{itemId}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalItemUpdateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: PUT /api/agile/projects/{projectId}/items/{itemId}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalItemDeleteRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: DELETE /api/agile/projects/{projectId}/items/{itemId}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
+  PortalStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref PortalApi
+      StageName: '$default'
+      AutoDeploy: true
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+
+  PortalLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RuntimeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PortalApi}/*/*'
+
+  PortalCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: CreateManagedPortalCertificate
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DomainName: !Ref CustomDomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref CustomDomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  PortalDomainName:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: CreateCustomDomain
+    Properties:
+      DomainName: !Ref CustomDomainName
+      DomainNameConfigurations:
+        - CertificateArn: !If
+            - UseExistingPortalCertificate
+            - !Ref PortalCertificateArn
+            - !Ref PortalCertificate
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref EnvironmentName
+
+  PortalApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: CreateCustomDomain
+    Properties:
+      ApiId: !Ref PortalApi
+      DomainName: !Ref PortalDomainName
+      Stage: !Ref PortalStage
+
+  PortalDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: ManagePortalDnsRecords
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${CustomDomainName}.'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt PortalDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt PortalDomainName.RegionalHostedZoneId
+
+  PortalDnsIpv6Record:
+    Type: AWS::Route53::RecordSet
+    Condition: ManagePortalDnsRecords
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${CustomDomainName}.'
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt PortalDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt PortalDomainName.RegionalHostedZoneId
+
+Outputs:
+  AgileStateTableName:
+    Value: !Ref AgileStateTable
+  RuntimeFunctionName:
+    Value: !Ref RuntimeFunction
+  PortalApiEndpoint:
+    Value: !Sub 'https://${PortalApi}.execute-api.${AWS::Region}.amazonaws.com'
+  HostedPortalUrl:
+    Value: !If
+      - CreateCustomDomain
+      - !Sub 'https://${CustomDomainName}'
+      - !Sub 'https://${PortalApi}.execute-api.${AWS::Region}.amazonaws.com'
+  PortalCustomDomainUrl:
+    Condition: CreateCustomDomain
+    Value: !Sub 'https://${CustomDomainName}'
+  PortalCustomDomainRegionalDomainName:
+    Condition: CreateCustomDomain
+    Value: !GetAtt PortalDomainName.RegionalDomainName
+  PortalCustomDomainRegionalHostedZoneId:
+    Condition: CreateCustomDomain
+    Value: !GetAtt PortalDomainName.RegionalHostedZoneId

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xleo-agile-workspace"
+version = "0.1.0"
+description = "AWS-hosted agile workspace for projects, stories, tasks, and acceptance criteria"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Brian W and Codex" }]
+license = { text = "Proprietary" }
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["xleo_agile_workspace*"]
+
+[tool.setuptools.package-data]
+xleo_agile_workspace = ["portal_assets/*"]

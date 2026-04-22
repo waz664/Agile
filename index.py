@@ -1,0 +1,1 @@
+from xleo_agile_workspace.aws_runtime import lambda_handler as handler
