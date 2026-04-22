@@ -333,6 +333,15 @@ Resources:
       AuthorizerId: !Ref PortalApiAuthorizer
       Target: !Sub 'integrations/${PortalApiIntegration}'
 
+  PortalServiceKeyUpdateRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: PUT /api/service-keys/{keyId}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref PortalApiAuthorizer
+      Target: !Sub 'integrations/${PortalApiIntegration}'
+
   PortalServiceKeyDeleteRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties:

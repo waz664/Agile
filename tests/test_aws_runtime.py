@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime
 from unittest.mock import patch
 
@@ -297,7 +298,8 @@ class AwsRuntimeTests(unittest.TestCase):
                 {
                     "serviceKey": {
                         "label": "Planning Bot",
-                        "allowedProjectIds": ["workspace-refresh"],
+                        "scopeMode": "projects",
+                        "projectIds": ["workspace-refresh"],
                     }
                 }
             ),
@@ -334,6 +336,9 @@ class AwsRuntimeTests(unittest.TestCase):
         self.assertTrue(create_payload["ok"])
         self.assertEqual(create_payload["serviceKey"]["keyId"], "abc123def456")
         self.assertEqual(create_payload["serviceKey"]["label"], "Planning Bot")
+        self.assertEqual(create_payload["serviceKey"]["scopeMode"], "projects")
+        self.assertEqual(create_payload["serviceKey"]["scopeSource"], "explicit")
+        self.assertEqual(create_payload["serviceKey"]["projectIds"], ["workspace-refresh"])
         self.assertEqual(create_payload["serviceKey"]["allowedProjectIds"], ["workspace-refresh"])
         self.assertEqual(
             create_payload["plaintextKey"],
@@ -370,6 +375,47 @@ class AwsRuntimeTests(unittest.TestCase):
         self.assertEqual(list_result["statusCode"], 200)
         self.assertEqual(len(list_payload["serviceKeys"]), 1)
         self.assertNotIn("plaintextKey", list_payload["serviceKeys"][0])
+        self.assertEqual(list_payload["serviceKeys"][0]["scopeMode"], "projects")
+
+        update_event = {
+            "rawPath": "/api/service-keys/abc123def456",
+            "body": json.dumps(
+                {
+                    "serviceKey": {
+                        "label": "Planning Bot Updated",
+                        "scopeMode": "workspace",
+                    }
+                }
+            ),
+            "requestContext": {
+                "http": {"method": "PUT"},
+                "authorizer": {
+                    "jwt": {
+                        "claims": {
+                            "email": "brianw@xleo.com",
+                            "name": "Brian W",
+                        }
+                    }
+                },
+            },
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "PORTAL_ALLOWED_EMAILS": "brianw@xleo.com",
+                "PORTAL_SUPER_ADMIN_EMAILS": "brianw@xleo.com",
+                "AGILE_STATE_TABLE": "xleo-agile-workspace-dev-state",
+            },
+            clear=False,
+        ):
+            update_result = lambda_handler(update_event, None)
+
+        update_payload = json.loads(update_result["body"])
+        self.assertEqual(update_result["statusCode"], 200)
+        self.assertEqual(update_payload["serviceKey"]["label"], "Planning Bot Updated")
+        self.assertEqual(update_payload["serviceKey"]["scopeMode"], "workspace")
+        self.assertEqual(update_payload["serviceKey"]["projectIds"], [])
 
         revoke_event = {
             "rawPath": "/api/service-keys/abc123def456",
@@ -420,6 +466,7 @@ class AwsRuntimeTests(unittest.TestCase):
                 status="active",
                 key_preview="agws_abc123def456_...",
                 secret_hash=hashlib.sha256("integrationsecretvalue123456".encode("utf-8")).hexdigest(),
+                scope_mode="projects",
                 allowed_project_ids=("workspace-refresh",),
                 created_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
                 updated_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
@@ -479,6 +526,7 @@ class AwsRuntimeTests(unittest.TestCase):
                 status="active",
                 key_preview="agws_abc123def456_...",
                 secret_hash=hashlib.sha256("integrationsecretvalue123456".encode("utf-8")).hexdigest(),
+                scope_mode="projects",
                 allowed_project_ids=("workspace-refresh",),
                 created_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
                 updated_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
@@ -527,6 +575,7 @@ class AwsRuntimeTests(unittest.TestCase):
                 status="active",
                 key_preview="agws_abc123def456_...",
                 secret_hash=hashlib.sha256("integrationsecretvalue123456".encode("utf-8")).hexdigest(),
+                scope_mode="projects",
                 allowed_project_ids=("workspace-refresh",),
                 created_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
                 updated_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
@@ -555,6 +604,119 @@ class AwsRuntimeTests(unittest.TestCase):
         payload = json.loads(result["body"])
         self.assertEqual(result["statusCode"], 403)
         self.assertIn("not allowed to access that project", payload["error"])
+
+    @patch("xleo_agile_workspace.aws_runtime.DynamoDbAgileStore")
+    def test_lambda_handler_rejects_project_scoped_service_key_for_project_create(self, store_class) -> None:
+        store = _InMemoryAgileStore()
+        store.save_service_api_key(
+            ServiceApiKeyRecord(
+                key_id="abc123def456",
+                label="Planning Bot",
+                status="active",
+                key_preview="agws_abc123def456_...",
+                secret_hash=hashlib.sha256("integrationsecretvalue123456".encode("utf-8")).hexdigest(),
+                scope_mode="projects",
+                allowed_project_ids=("hockeymanageragent",),
+                created_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+                updated_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+            )
+        )
+        store_class.return_value = store
+        event = {
+            "rawPath": "/service/agile/projects",
+            "body": json.dumps(
+                {
+                    "project": {
+                        "projectId": "hockeymanageragent",
+                        "name": "HockeyManagerAgent",
+                    }
+                }
+            ),
+            "headers": {
+                "x-api-key": "agws_abc123def456_integrationsecretvalue123456",
+            },
+            "requestContext": {
+                "http": {"method": "POST"},
+            },
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "AGILE_STATE_TABLE": "xleo-agile-workspace-dev-state",
+            },
+            clear=False,
+        ):
+            result = lambda_handler(event, None)
+
+        payload = json.loads(result["body"])
+        self.assertEqual(result["statusCode"], 403)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(store.list_agile_projects(), ())
+
+    @patch("xleo_agile_workspace.aws_runtime.DynamoDbAgileStore")
+    def test_lambda_handler_allows_workspace_service_key_to_create_project(self, store_class) -> None:
+        store = _InMemoryAgileStore()
+        store.save_service_api_key(
+            ServiceApiKeyRecord(
+                key_id="abc123def456",
+                label="Workspace Bot",
+                status="active",
+                key_preview="agws_abc123def456_...",
+                secret_hash=hashlib.sha256("integrationsecretvalue123456".encode("utf-8")).hexdigest(),
+                scope_mode="workspace",
+                created_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+                updated_at_utc=datetime(2026, 4, 22, 0, 0, tzinfo=UTC),
+            )
+        )
+        store_class.return_value = store
+        event = {
+            "rawPath": "/service/agile/projects",
+            "body": json.dumps(
+                {
+                    "project": {
+                        "projectId": "workspace-refresh",
+                        "name": "Workspace Refresh",
+                    }
+                }
+            ),
+            "headers": {
+                "x-api-key": "agws_abc123def456_integrationsecretvalue123456",
+            },
+            "requestContext": {
+                "http": {"method": "POST"},
+            },
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "AGILE_STATE_TABLE": "xleo-agile-workspace-dev-state",
+            },
+            clear=False,
+        ):
+            result = lambda_handler(event, None)
+
+        payload = json.loads(result["body"])
+        self.assertEqual(result["statusCode"], 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["projectCreated"])
+        self.assertEqual(payload["project"]["projectId"], "workspace-refresh")
+
+    def test_service_api_key_record_infers_legacy_project_scope(self) -> None:
+        record = ServiceApiKeyRecord.from_dict(
+            {
+                "keyId": "abc123def456",
+                "label": "Legacy Bot",
+                "secretHash": hashlib.sha256("integrationsecretvalue123456".encode("utf-8")).hexdigest(),
+                "keyPreview": "agws_abc123def456_...",
+                "allowedProjectIds": ["hockeymanageragent"],
+            }
+        )
+
+        self.assertEqual(record.scope_mode, "projects")
+        self.assertEqual(record.scope_source, "legacy_allowed_projects")
+        self.assertEqual(record.allowed_project_ids, ("hockeymanageragent",))
 
     @patch("xleo_agile_workspace.aws_runtime.DynamoDbAgileStore")
     def test_lambda_handler_rejects_service_route_without_service_api_key(self, store_class) -> None:
@@ -661,17 +823,7 @@ class _InMemoryAgileStore:
     def touch_service_api_key_usage(self, key_id: str) -> None:
         existing = self.load_service_api_key(key_id)
         used_at = datetime.now(UTC)
-        self.service_keys[key_id] = ServiceApiKeyRecord(
-            key_id=existing.key_id,
-            label=existing.label,
-            status=existing.status,
-            key_preview=existing.key_preview,
-            secret_hash=existing.secret_hash,
-            allowed_project_ids=existing.allowed_project_ids,
-            created_at_utc=existing.created_at_utc,
-            updated_at_utc=used_at,
-            last_used_at_utc=used_at,
-        )
+        self.service_keys[key_id] = replace(existing, updated_at_utc=used_at, last_used_at_utc=used_at)
 
     def try_load_agile_project(self, project_id: str):
         return self.projects.get(project_id)

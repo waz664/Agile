@@ -511,6 +511,9 @@ function renderProjectSettingsSection(canManage) {
 }
 
 function renderServiceAccessSection() {
+  const isEditing = Boolean(state.serviceKeyDraft.key_id);
+  const scopeMode = state.serviceKeyDraft.scope_mode || "workspace";
+  const knownProjectIds = state.projects.map((project) => project.projectId).filter(Boolean);
   return `
     <section class="settings-section">
       <div class="settings-section-header">
@@ -518,7 +521,10 @@ function renderServiceAccessSection() {
           <p class="section-label">Service access</p>
           <h3 class="surface-title">Codex API keys</h3>
         </div>
-        <button class="button button-primary" type="button" data-action="create-service-key">Generate key</button>
+        <div class="settings-actions">
+          <button class="button" type="button" data-action="reset-service-key-draft">${isEditing ? "New key" : "Clear form"}</button>
+          <button class="button button-primary" type="button" data-action="save-service-key">${isEditing ? "Save changes" : "Generate key"}</button>
+        </div>
       </div>
       <div class="settings-section-body">
         ${renderNotice(state.serviceKeyNotice)}
@@ -526,6 +532,7 @@ function renderServiceAccessSection() {
           <div class="stack">
             <p class="meta-label">Trusted automation</p>
             <p class="meta-text">Use <span class="mono">X-API-Key</span> from another Codex project against <span class="mono">${escapeHtml(serviceBaseUrl())}/agile/projects</span>.</p>
+            <p class="meta-text">Workspace-wide keys can create projects. Project-scoped keys can only list and mutate their allowed project ids.</p>
           </div>
         </div>
         <div class="service-key-form">
@@ -533,11 +540,27 @@ function renderServiceAccessSection() {
             editor: "service-key",
             placeholder: "Personal Codex automation",
           })}
-          ${renderField("Allowed project IDs", "allowed_project_ids", joinList(state.serviceKeyDraft.allowed_project_ids || []), {
+          ${renderField("Scope", "scope_mode", scopeMode, {
+            editor: "service-key",
+            type: "select",
+            options: serviceKeyScopeOptions(),
+          })}
+          ${scopeMode === "projects" ? renderField("Allowed project IDs", "project_ids", joinList(state.serviceKeyDraft.project_ids || []), {
             editor: "service-key",
             valueType: "csv",
-            placeholder: "Leave blank for full workspace access, or enter ids like hockeymanageragent",
-          })}
+            placeholder: "Enter one or more project ids like hockeymanageragent",
+          }) : ""}
+          ${knownProjectIds.length ? `
+            <p class="small-note">Known project ids: ${escapeHtml(knownProjectIds.join(", "))}</p>
+          ` : ""}
+          ${isEditing && state.serviceKeyDraft.scope_source && state.serviceKeyDraft.scope_source !== "explicit" ? `
+            <div class="service-key-callout">
+              <div class="stack">
+                <p class="meta-label">Legacy scope</p>
+                <p class="meta-text">This key is still using the older implicit project list format. Saving will convert it to the explicit scope model.</p>
+              </div>
+            </div>
+          ` : ""}
           ${state.createdServiceKey ? `
             <div class="service-key-callout">
               <div class="stack">
@@ -754,9 +777,19 @@ function renderBoardCard(item, itemMaps) {
 }
 
 function renderServiceKeyRow(serviceKey) {
-  const scopeText = Array.isArray(serviceKey.allowedProjectIds) && serviceKey.allowedProjectIds.length
-    ? `Projects: ${serviceKey.allowedProjectIds.join(", ")}`
-    : "Projects: full workspace";
+  const isEditing = state.serviceKeyDraft.key_id === serviceKey.keyId;
+  const projectIds = normalizeStringArray(serviceKey.projectIds || serviceKey.allowedProjectIds || []);
+  const scopeMode = serviceKey.scopeMode || (projectIds.length ? "projects" : "workspace");
+  const scopeText = scopeMode === "workspace"
+    ? "Workspace-wide access, including project creation."
+    : `Projects: ${projectIds.join(", ")}`;
+  const scopeBadge = renderBadge(
+    scopeMode === "workspace" ? "Workspace-wide" : "Project-scoped",
+    scopeMode === "workspace" ? "accent" : "warning",
+  );
+  const legacyBadge = serviceKey.scopeSource && serviceKey.scopeSource !== "explicit"
+    ? renderBadge("Legacy scope", "warning")
+    : "";
   return `
     <div class="service-key-row">
       <div class="service-key-row__body">
@@ -766,10 +799,19 @@ function renderServiceKeyRow(serviceKey) {
           ${escapeHtml(`Created ${formatTimestamp(serviceKey.createdAtUtc)}`)}
           ${serviceKey.lastUsedAtUtc ? ` | ${escapeHtml(`Last used ${formatTimestamp(serviceKey.lastUsedAtUtc)}`)}` : ""}
         </div>
+        <div class="service-key-row__meta">${scopeBadge}${legacyBadge}</div>
         <div class="service-key-row__meta">${escapeHtml(scopeText)}</div>
       </div>
       <div class="service-key-row__meta">
         ${renderBadge(formatServiceKeyStatus(serviceKey.status), serviceKey.status === "active" ? "accent" : "neutral")}
+        <button
+          class="button"
+          type="button"
+          data-action="edit-service-key"
+          data-service-key-id="${escapeHtml(serviceKey.keyId)}"
+        >
+          ${isEditing ? "Editing" : "Edit"}
+        </button>
         <button
           class="button"
           type="button"
@@ -981,8 +1023,14 @@ async function handleWorkspaceViewClick(event) {
     case "delete-project":
       await deleteSelectedProject();
       break;
-    case "create-service-key":
-      await createServiceKey();
+    case "save-service-key":
+      await saveServiceKeyDraft();
+      break;
+    case "edit-service-key":
+      beginEditServiceKey(actionButton.dataset.serviceKeyId);
+      break;
+    case "reset-service-key-draft":
+      resetServiceKeyDraft();
       break;
     case "revoke-service-key":
       await revokeServiceKey(actionButton.dataset.serviceKeyId);
@@ -1008,6 +1056,10 @@ function handleWorkspaceViewInput(event) {
 
   if (editor === "service-key" && state.serviceKeyDraft) {
     setNestedValue(state.serviceKeyDraft, path, readControlValue(control));
+    if (path === "scope_mode" && state.serviceKeyDraft.scope_mode !== "projects") {
+      state.serviceKeyDraft.project_ids = [];
+    }
+    renderWorkspaceView();
   }
 }
 
@@ -1245,29 +1297,77 @@ async function deleteSelectedItem() {
   renderAll();
 }
 
-async function createServiceKey() {
-  setServiceKeyNotice("Generating service key...", "");
+async function saveServiceKeyDraft() {
+  const draft = state.serviceKeyDraft || buildBlankServiceKeyDraft();
+  const isEditing = Boolean(draft.key_id);
+  const projectIds = draft.scope_mode === "projects"
+    ? normalizeStringArray(draft.project_ids || [])
+    : [];
+
+  setServiceKeyNotice(isEditing ? "Saving service key scope..." : "Generating service key...", "");
   renderAll();
 
   try {
-    const response = await apiRequest("/api/service-keys", {
-      method: "POST",
-      body: JSON.stringify({
-        serviceKey: {
-          label: String(state.serviceKeyDraft.label || "").trim(),
-          allowedProjectIds: normalizeStringArray(state.serviceKeyDraft.allowed_project_ids || []),
-        },
-      }),
-    });
-    state.createdServiceKey = response.plaintextKey || null;
-    state.serviceKeyDraft = buildBlankServiceKeyDraft();
+    const response = await apiRequest(
+      isEditing ? `/api/service-keys/${encodeURIComponent(draft.key_id)}` : "/api/service-keys",
+      {
+        method: isEditing ? "PUT" : "POST",
+        body: JSON.stringify({
+          serviceKey: {
+            label: String(draft.label || "").trim(),
+            scopeMode: draft.scope_mode || "workspace",
+            projectIds,
+          },
+        }),
+      },
+    );
+    state.createdServiceKey = isEditing ? null : response.plaintextKey || null;
+    state.serviceKeyDraft = isEditing
+      ? normalizeServiceKeyDraft(response.serviceKey)
+      : buildBlankServiceKeyDraft();
     await loadServiceKeys();
-    setServiceKeyNotice("Service key created. Copy it now, then use it with X-API-Key.", "is-success");
+    setServiceKeyNotice(
+      isEditing
+        ? "Service key scope updated."
+        : "Service key created. Copy it now, then use it with X-API-Key.",
+      "is-success",
+    );
   } catch (error) {
     console.error(error);
-    setServiceKeyNotice(error.message || "Could not create the service key.", "is-error");
+    setServiceKeyNotice(
+      error.message || (isEditing ? "Could not update the service key." : "Could not create the service key."),
+      "is-error",
+    );
   }
 
+  renderAll();
+}
+
+function beginEditServiceKey(keyId) {
+  if (!keyId) {
+    return;
+  }
+
+  const serviceKey = state.serviceKeys.find((item) => item.keyId === keyId);
+  if (!serviceKey) {
+    return;
+  }
+
+  state.createdServiceKey = null;
+  state.serviceKeyDraft = normalizeServiceKeyDraft(serviceKey);
+  setServiceKeyNotice(
+    serviceKey.scopeSource && serviceKey.scopeSource !== "explicit"
+      ? "Editing a legacy-scoped key. Saving will convert it to the explicit scope model."
+      : "Editing service key scope.",
+    "",
+  );
+  renderAll();
+}
+
+function resetServiceKeyDraft() {
+  state.serviceKeyDraft = buildBlankServiceKeyDraft();
+  state.createdServiceKey = null;
+  setServiceKeyNotice("", "");
   renderAll();
 }
 
@@ -1383,8 +1483,24 @@ function buildBlankItemDraft(projectId, itemType = "story", parentId = "") {
 
 function buildBlankServiceKeyDraft() {
   return {
+    key_id: "",
     label: "",
-    allowed_project_ids: [],
+    scope_mode: "workspace",
+    project_ids: [],
+    scope_source: "explicit",
+    status: "active",
+  };
+}
+
+function normalizeServiceKeyDraft(serviceKey) {
+  const projectIds = normalizeStringArray(serviceKey?.projectIds || serviceKey?.allowedProjectIds || []);
+  return {
+    key_id: serviceKey?.keyId || serviceKey?.key_id || "",
+    label: serviceKey?.label || "",
+    scope_mode: serviceKey?.scopeMode || (projectIds.length ? "projects" : "workspace"),
+    project_ids: projectIds,
+    scope_source: serviceKey?.scopeSource || "explicit",
+    status: serviceKey?.status || "active",
   };
 }
 
@@ -1592,6 +1708,13 @@ function formatPriority(value) {
 
 function formatServiceKeyStatus(value) {
   return value === "revoked" ? "Revoked" : "Active";
+}
+
+function serviceKeyScopeOptions() {
+  return [
+    { value: "workspace", label: "Workspace-wide" },
+    { value: "projects", label: "Specific projects" },
+  ];
 }
 
 function formatTimestamp(value) {

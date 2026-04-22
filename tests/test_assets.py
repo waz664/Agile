@@ -23,6 +23,7 @@ class AssetTests(unittest.TestCase):
         self.assertIn("POST /api/agile/projects/{projectId}/items", template)
         self.assertIn("GET /api/service-keys", template)
         self.assertIn("POST /api/service-keys", template)
+        self.assertIn("PUT /api/service-keys/{keyId}", template)
         self.assertIn("DELETE /api/service-keys/{keyId}", template)
         self.assertIn("ANY /service/{proxy+}", template)
 
@@ -39,6 +40,8 @@ class AssetTests(unittest.TestCase):
         self.assertIn("X-API-Key", ui_js)
         self.assertIn("Codex API keys", ui_js)
         self.assertIn("Allowed project IDs", ui_js)
+        self.assertIn("Workspace-wide", ui_js)
+        self.assertIn("scopeMode", ui_js)
         self.assertIn("workspace-admin", publish_script)
         self.assertIn("New-CGIPUserPoolClient", deploy_script)
         self.assertIn("New-CGIPManagedLoginBranding", deploy_script)

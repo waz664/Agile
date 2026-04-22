@@ -6,7 +6,7 @@ import json
 import os
 import re
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from importlib.resources import files
 from typing import Any
@@ -30,9 +30,14 @@ class PortalUserContext:
     groups: tuple[str, ...]
     is_super_admin: bool
     allowed_project_ids: tuple[str, ...] = ()
+    can_manage_agile: bool = False
+    can_create_projects: bool = False
+    service_key_id: str | None = None
+    service_key_scope_mode: str | None = None
 
 
 SERVICE_API_KEY_STATUSES = ("active", "revoked")
+SERVICE_API_KEY_SCOPE_MODES = ("workspace", "projects")
 SERVICE_API_KEY_PK = "CONFIG#SERVICE_API_KEYS"
 SERVICE_API_KEY_TOKEN_PATTERN = re.compile(r"^agws_([a-f0-9]{12})_([A-Za-z0-9\-_]{24,})$")
 
@@ -43,7 +48,9 @@ class ServiceApiKeyRecord:
     label: str
     secret_hash: str
     key_preview: str
+    scope_mode: str = "workspace"
     allowed_project_ids: tuple[str, ...] = ()
+    scope_source: str = "explicit"
     status: str = "active"
     created_at_utc: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at_utc: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -58,9 +65,31 @@ class ServiceApiKeyRecord:
             field_name="status",
             allowed_values=SERVICE_API_KEY_STATUSES,
         )
-        allowed_project_ids = _normalize_project_id_list(
-            payload.get("allowed_project_ids", payload.get("allowedProjectIds"))
-        )
+        explicit_scope_mode = _optional_text(payload.get("scope_mode", payload.get("scopeMode")))
+        explicit_project_ids = payload.get("project_ids", payload.get("projectIds"))
+        legacy_project_ids = payload.get("allowed_project_ids", payload.get("allowedProjectIds"))
+        project_id_source = explicit_project_ids if explicit_project_ids is not None else legacy_project_ids
+        allowed_project_ids = _normalize_project_id_list(project_id_source)
+        if explicit_scope_mode:
+            scope_mode = _normalize_choice(
+                explicit_scope_mode,
+                field_name="scope_mode",
+                allowed_values=SERVICE_API_KEY_SCOPE_MODES,
+            )
+            scope_source = "explicit"
+        elif explicit_project_ids is not None:
+            scope_mode = "projects" if allowed_project_ids else "workspace"
+            scope_source = "explicit"
+        elif allowed_project_ids:
+            scope_mode = "projects"
+            scope_source = "legacy_allowed_projects"
+        else:
+            scope_mode = "workspace"
+            scope_source = "legacy_full_workspace"
+        if scope_mode == "workspace":
+            allowed_project_ids = ()
+        elif not allowed_project_ids:
+            raise ValueError("Project-scoped service API keys must include at least one project id.")
         reference_time = datetime.now(UTC)
         created_at = _coerce_datetime(payload.get("created_at_utc", payload.get("createdAtUtc")))
         updated_at = _coerce_datetime(payload.get("updated_at_utc", payload.get("updatedAtUtc")))
@@ -70,7 +99,9 @@ class ServiceApiKeyRecord:
             label=_optional_text(payload.get("label")) or "Codex integration",
             secret_hash=secret_hash,
             key_preview=_optional_text(payload.get("key_preview", payload.get("keyPreview"))) or f"agws_{key_id}_...",
+            scope_mode=scope_mode,
             allowed_project_ids=allowed_project_ids,
+            scope_source=scope_source,
             status=status,
             created_at_utc=created_at or reference_time,
             updated_at_utc=updated_at or created_at or reference_time,
@@ -167,6 +198,9 @@ def handle_api_request(
         return response(200, create_service_api_key_from_payload(store=store, body=body))
 
     service_key_id = _path_match(path, r"^/api/service-keys/([^/]+)$")
+    if service_key_id and method == "PUT":
+        require_portal_permission(user, "agile.manage")
+        return response(200, update_service_api_key_from_payload(store=store, key_id=service_key_id, body=body))
     if service_key_id and method == "DELETE":
         require_portal_permission(user, "agile.manage")
         return response(200, revoke_service_api_key_from_payload(store=store, key_id=service_key_id))
@@ -224,12 +258,12 @@ def handle_agile_request(
     if method == "GET" and path == f"{path_prefix}/agile/projects":
         include_archived = _query_string_value(event, "includeArchived", "include_archived") in {"true", "1", "yes"}
         limit = _optional_int(_query_string_value(event, "limit")) or 50
-        store_limit = max(1, limit) if not user.allowed_project_ids else 500
-        projects = tuple(
-            project
-            for project in store.list_agile_projects(limit=store_limit, include_archived=include_archived)
-            if _user_can_access_project(user, project.project_id)
-        )[: max(1, limit)]
+        projects = _list_projects_for_user(
+            store=store,
+            user=user,
+            limit=max(1, limit),
+            include_archived=include_archived,
+        )
         return response(
             200,
             {
@@ -244,8 +278,7 @@ def handle_agile_request(
         )
 
     if method == "POST" and path == f"{path_prefix}/agile/projects":
-        require_portal_permission(user, "agile.manage")
-        _ensure_project_access(user, _project_id_from_body(body))
+        require_portal_permission(user, "agile.create_projects")
         return response(
             200,
             upsert_agile_project_from_payload(store=store, body=body, allow_create=True),
@@ -277,10 +310,12 @@ def handle_agile_request(
             )
         if method == "DELETE":
             require_portal_permission(user, "agile.manage")
-            return response(
-                200,
-                delete_agile_project_from_payload(store=store, project_id=project_id),
+            payload = delete_agile_project_from_payload(store=store, project_id=project_id)
+            payload["remainingProjects"] = _filter_project_summaries_for_user(
+                user=user,
+                projects=payload.get("remainingProjects", []),
             )
+            return response(200, payload)
 
     project_items_id = _path_match(path, rf"^{escaped_prefix}/agile/projects/([^/]+)/items$")
     if project_items_id:
@@ -442,7 +477,8 @@ def build_portal_session_payload(user: PortalUserContext) -> dict[str, Any]:
 def build_portal_permissions(user: PortalUserContext) -> dict[str, Any]:
     return {
         "agileView": True,
-        "agileManage": user.is_super_admin,
+        "agileManage": user.can_manage_agile,
+        "agileCreateProjects": user.can_create_projects,
         "allowedProjectIds": list(user.allowed_project_ids),
     }
 
@@ -476,6 +512,8 @@ def resolve_portal_user(event: dict[str, Any]) -> PortalUserContext:
         display_name=name,
         groups=groups,
         is_super_admin=normalized_email in super_admins,
+        can_manage_agile=normalized_email in super_admins,
+        can_create_projects=normalized_email in super_admins,
     )
 
 
@@ -500,8 +538,12 @@ def resolve_service_api_key_user(
         email=f"service-key:{record.key_id}",
         display_name=record.label,
         groups=("service",),
-        is_super_admin=True,
+        is_super_admin=False,
         allowed_project_ids=record.allowed_project_ids,
+        can_manage_agile=True,
+        can_create_projects=record.scope_mode == "workspace",
+        service_key_id=record.key_id,
+        service_key_scope_mode=record.scope_mode,
     )
 
 
@@ -509,11 +551,12 @@ def require_portal_permission(user: PortalUserContext, permission_key: str) -> N
     permissions = build_portal_permissions(user)
     permission_map = {
         "agile.manage": "agileManage",
+        "agile.create_projects": "agileCreateProjects",
         "agile.view": "agileView",
     }
     resolved_key = permission_map.get(permission_key, permission_key)
     if not permissions.get(resolved_key):
-        raise PermissionError("You do not have permission to manage agile projects in this workspace.")
+        raise PermissionError("You do not have permission to perform that agile workspace action.")
 
 
 def serialize_service_api_key(
@@ -526,6 +569,10 @@ def serialize_service_api_key(
         "label": record.label,
         "status": record.status,
         "keyPreview": record.key_preview,
+        "scopeMode": record.scope_mode,
+        "scopeSource": record.scope_source,
+        "scopeVersion": 2 if record.scope_source == "explicit" else 1,
+        "projectIds": list(record.allowed_project_ids),
         "allowedProjectIds": list(record.allowed_project_ids),
         "createdAtUtc": record.created_at_utc.isoformat(),
         "updatedAtUtc": record.updated_at_utc.isoformat(),
@@ -541,14 +588,9 @@ def create_service_api_key_from_payload(
     store: "DynamoDbAgileStore",
     body: dict[str, Any],
 ) -> dict[str, Any]:
-    payload = body.get("serviceKey") if isinstance(body.get("serviceKey"), dict) else body
-    if payload and not isinstance(payload, dict):
-        raise ValueError("Service key payload must be an object.")
-
-    key_label = _optional_text((payload or {}).get("label")) or "Codex integration"
-    allowed_project_ids = _normalize_project_id_list(
-        (payload or {}).get("allowed_project_ids", (payload or {}).get("allowedProjectIds"))
-    )
+    payload = _service_key_payload_from_body(body)
+    key_label = _optional_text(payload.get("label")) or "Codex integration"
+    scope_mode, allowed_project_ids = _service_key_scope_from_payload(payload)
     key_id, plaintext_key, key_preview, secret_hash = _generate_service_api_key_material(store=store)
     now = datetime.now(UTC)
     record = ServiceApiKeyRecord(
@@ -557,7 +599,9 @@ def create_service_api_key_from_payload(
         status="active",
         key_preview=key_preview,
         secret_hash=secret_hash,
+        scope_mode=scope_mode,
         allowed_project_ids=allowed_project_ids,
+        scope_source="explicit",
         created_at_utc=now,
         updated_at_utc=now,
         last_used_at_utc=None,
@@ -567,6 +611,35 @@ def create_service_api_key_from_payload(
         "ok": True,
         "serviceKey": serialize_service_api_key(record),
         "plaintextKey": plaintext_key,
+    }
+
+
+def update_service_api_key_from_payload(
+    *,
+    store: "DynamoDbAgileStore",
+    key_id: str,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    existing = store.load_service_api_key(key_id)
+    payload = _service_key_payload_from_body(body)
+
+    label = existing.label
+    if "label" in payload:
+        label = _required_text(payload.get("label"), "label")
+
+    scope_mode, allowed_project_ids = _service_key_scope_from_payload(payload, existing=existing)
+    updated = replace(
+        existing,
+        label=label,
+        scope_mode=scope_mode,
+        allowed_project_ids=allowed_project_ids,
+        scope_source="explicit",
+        updated_at_utc=datetime.now(UTC),
+    )
+    store.save_service_api_key(updated)
+    return {
+        "ok": True,
+        "serviceKey": serialize_service_api_key(updated),
     }
 
 
@@ -582,23 +655,78 @@ def revoke_service_api_key_from_payload(
             "serviceKey": serialize_service_api_key(existing),
         }
 
-    now = datetime.now(UTC)
-    revoked = ServiceApiKeyRecord(
-        key_id=existing.key_id,
-        label=existing.label,
-        status="revoked",
-        key_preview=existing.key_preview,
-        secret_hash=existing.secret_hash,
-        allowed_project_ids=existing.allowed_project_ids,
-        created_at_utc=existing.created_at_utc,
-        updated_at_utc=now,
-        last_used_at_utc=existing.last_used_at_utc,
-    )
+    revoked = replace(existing, status="revoked", updated_at_utc=datetime.now(UTC))
     store.save_service_api_key(revoked)
     return {
         "ok": True,
         "serviceKey": serialize_service_api_key(revoked),
     }
+
+
+def serialize_service_api_key_record(record: ServiceApiKeyRecord) -> dict[str, Any]:
+    payload = {
+        "keyId": record.key_id,
+        "label": record.label,
+        "status": record.status,
+        "keyPreview": record.key_preview,
+        "allowedProjectIds": list(record.allowed_project_ids),
+        "createdAtUtc": record.created_at_utc.isoformat(),
+        "updatedAtUtc": record.updated_at_utc.isoformat(),
+        "lastUsedAtUtc": record.last_used_at_utc.isoformat() if record.last_used_at_utc else None,
+        "secretHash": record.secret_hash,
+    }
+    if record.scope_source == "explicit":
+        payload["scopeMode"] = record.scope_mode
+        payload["projectIds"] = list(record.allowed_project_ids)
+        payload["scopeVersion"] = 2
+    return payload
+
+
+def _service_key_payload_from_body(body: dict[str, Any]) -> dict[str, Any]:
+    payload = body.get("serviceKey") if isinstance(body.get("serviceKey"), dict) else body
+    if payload and not isinstance(payload, dict):
+        raise ValueError("Service key payload must be an object.")
+    return dict(payload or {})
+
+
+def _service_key_scope_from_payload(
+    payload: dict[str, Any],
+    *,
+    existing: ServiceApiKeyRecord | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    explicit_scope_mode = _optional_text(payload.get("scope_mode", payload.get("scopeMode")))
+    has_explicit_project_ids = "project_ids" in payload or "projectIds" in payload
+    has_legacy_project_ids = "allowed_project_ids" in payload or "allowedProjectIds" in payload
+
+    if has_explicit_project_ids:
+        allowed_project_ids = _normalize_project_id_list(payload.get("project_ids", payload.get("projectIds")))
+    elif has_legacy_project_ids:
+        allowed_project_ids = _normalize_project_id_list(
+            payload.get("allowed_project_ids", payload.get("allowedProjectIds"))
+        )
+    elif existing is not None:
+        allowed_project_ids = existing.allowed_project_ids
+    else:
+        allowed_project_ids = ()
+
+    if explicit_scope_mode:
+        scope_mode = _normalize_choice(
+            explicit_scope_mode,
+            field_name="scope_mode",
+            allowed_values=SERVICE_API_KEY_SCOPE_MODES,
+        )
+    elif existing is not None:
+        scope_mode = existing.scope_mode
+    elif allowed_project_ids:
+        scope_mode = "projects"
+    else:
+        scope_mode = "workspace"
+
+    if scope_mode == "workspace":
+        return scope_mode, ()
+    if not allowed_project_ids:
+        raise ValueError("Project-scoped service API keys must include at least one project id.")
+    return scope_mode, allowed_project_ids
 
 
 def summarize_agile_project(
@@ -829,24 +957,14 @@ class DynamoDbAgileStore:
                 "keyStatus": record.status,
                 "label": record.label,
                 "updatedAtUtc": record.updated_at_utc.isoformat(),
-                "payloadJson": json.dumps(serialize_service_api_key(record, include_secret_hash=True)),
+                "payloadJson": json.dumps(serialize_service_api_key_record(record)),
             }
         )
 
     def touch_service_api_key_usage(self, key_id: str) -> None:
         existing = self.load_service_api_key(key_id)
         used_at = datetime.now(UTC)
-        updated = ServiceApiKeyRecord(
-            key_id=existing.key_id,
-            label=existing.label,
-            status=existing.status,
-            key_preview=existing.key_preview,
-            secret_hash=existing.secret_hash,
-            allowed_project_ids=existing.allowed_project_ids,
-            created_at_utc=existing.created_at_utc,
-            updated_at_utc=used_at,
-            last_used_at_utc=used_at,
-        )
+        updated = replace(existing, updated_at_utc=used_at, last_used_at_utc=used_at)
         self.save_service_api_key(updated)
 
     def try_load_agile_project(self, project_id: str) -> AgileProject | None:
@@ -1031,6 +1149,41 @@ def _project_id_from_body(body: dict[str, Any]) -> str:
     if explicit_id:
         return _slugify(explicit_id)
     return _slugify(_required_text(payload.get("name"), "name"))
+
+
+def _list_projects_for_user(
+    *,
+    store: "DynamoDbAgileStore",
+    user: PortalUserContext,
+    limit: int,
+    include_archived: bool,
+) -> tuple[AgileProject, ...]:
+    if not user.allowed_project_ids:
+        return store.list_agile_projects(limit=limit, include_archived=include_archived)
+
+    projects: list[AgileProject] = []
+    for project_id in user.allowed_project_ids:
+        project = store.try_load_agile_project(project_id)
+        if project is None:
+            continue
+        if not include_archived and project.status != "active":
+            continue
+        projects.append(project)
+
+    projects.sort(key=lambda project: (project.status != "active", project.name.lower(), project.project_id))
+    return tuple(projects[:limit])
+
+
+def _filter_project_summaries_for_user(
+    *,
+    user: PortalUserContext,
+    projects: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        project
+        for project in projects
+        if _user_can_access_project(user, str(project.get("projectId") or project.get("project_id") or ""))
+    ]
 
 
 def _user_can_access_project(user: PortalUserContext, project_id: str) -> bool:
